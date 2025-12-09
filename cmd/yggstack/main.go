@@ -36,11 +36,11 @@ import (
 )
 
 type node struct {
-	core           *core.Core
-	multicast      *multicast.Multicast
-	admin          *admin.AdminSocket
-	socks5Tcp      net.Listener
-	socks5Unix     net.Listener
+	core       *core.Core
+	multicast  *multicast.Multicast
+	admin      *admin.AdminSocket
+	socks5Tcp  net.Listener
+	socks5Unix net.Listener
 }
 
 type UDPSession struct {
@@ -400,37 +400,49 @@ func main() {
 
 					remoteUdpAddrStr := remoteUdpAddr.String()
 
+					var udpFwdConn *gonet.UDPConn
 					connVal, ok := localUdpConnections.Load(remoteUdpAddrStr)
-
 					if !ok {
 						logger.Debugf("Creating new session for %s", remoteUdpAddr.String())
-						udpFwdConn, err := s.DialUDP(mapping.Mapped)
+						newConn, err := s.DialUDP(mapping.Mapped)
 						if err != nil {
 							logger.Errorf("Failed to connect to %s: %s", mapping.Mapped, err)
 							continue
 						}
 						udpSession := &UDPSession{
-							conn:       udpFwdConn,
+							conn:       newConn,
 							remoteAddr: remoteUdpAddr,
 						}
 						localUdpConnections.Store(remoteUdpAddrStr, udpSession)
-						go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, udpFwdConn)
+						udpFwdConn = newConn
+						// Start a goroutine to forward responses from Yggdrasil back to the client.
+						// This only reads from the Yggdrasil side; the main loop handles client->Yggdrasil.
+						go func(fwdConn *gonet.UDPConn, clientAddr net.Addr) {
+							buf := make([]byte, mtu)
+							for {
+								n, err := fwdConn.Read(buf)
+								if err != nil {
+									localUdpConnections.Delete(clientAddr.String())
+									return
+								}
+								if n > 0 {
+									_, _ = udpListenConn.WriteTo(buf[:n], clientAddr)
+								}
+							}
+						}(newConn, remoteUdpAddr)
+					} else {
+						udpSession, ok := connVal.(*UDPSession)
+						if !ok {
+							continue
+						}
+						udpFwdConn = udpSession.conn.(*gonet.UDPConn)
 					}
-
-					udpSession, ok := connVal.(*UDPSession)
-					if !ok {
-						continue
-					}
-
-					udpFwdConnPtr := udpSession.conn.(*gonet.UDPConn)
-					udpFwdConn := *udpFwdConnPtr
 
 					_, err = udpFwdConn.Write(udpBuffer[:bytesRead])
 					if err != nil {
-						logger.Debugf("Cannot write from yggdrasil to udp listener: %q", err)
+						logger.Debugf("Cannot write to yggdrasil: %q", err)
 						udpFwdConn.Close()
 						localUdpConnections.Delete(remoteUdpAddrStr)
-						continue
 					}
 				}
 			}(mapping)
@@ -488,40 +500,49 @@ func main() {
 
 					remoteUdpAddrStr := remoteUdpAddr.String()
 
-					var udpSession *UDPSession = nil
-
+					var udpFwdConn *net.UDPConn
 					connVal, ok := remoteUdpConnections.Load(remoteUdpAddrStr)
-
 					if !ok {
 						logger.Debugf("Creating new session for %s", remoteUdpAddr.String())
-						udpFwdConn, err := net.DialUDP("udp", nil, mapping.Mapped)
+						newConn, err := net.DialUDP("udp", nil, mapping.Mapped)
 						if err != nil {
 							logger.Errorf("Failed to connect to %s: %s", mapping.Mapped, err)
 							continue
 						}
-						udpSession = &UDPSession{
-							conn:       udpFwdConn,
+						udpSession := &UDPSession{
+							conn:       newConn,
 							remoteAddr: remoteUdpAddr,
 						}
 						remoteUdpConnections.Store(remoteUdpAddrStr, udpSession)
-						go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, udpFwdConn)
+						udpFwdConn = newConn
+						// Start a goroutine to forward responses from the local service back to the Yggdrasil peer.
+						// This only reads from the local side; the main loop handles Yggdrasil->local.
+						go func(fwdConn *net.UDPConn, clientAddr net.Addr) {
+							buf := make([]byte, mtu)
+							for {
+								n, err := fwdConn.Read(buf)
+								if err != nil {
+									remoteUdpConnections.Delete(clientAddr.String())
+									return
+								}
+								if n > 0 {
+									_, _ = udpListenConn.WriteTo(buf[:n], clientAddr)
+								}
+							}
+						}(newConn, remoteUdpAddr)
 					} else {
-						udpSession, ok = connVal.(*UDPSession)
-
+						udpSession, ok := connVal.(*UDPSession)
 						if !ok {
 							continue
 						}
+						udpFwdConn = udpSession.conn.(*net.UDPConn)
 					}
-
-					udpFwdConnPtr := udpSession.conn.(*net.UDPConn)
-					udpFwdConn := *udpFwdConnPtr
 
 					_, err = udpFwdConn.Write(udpBuffer[:bytesRead])
 					if err != nil {
-						logger.Debugf("Cannot write from yggdrasil to udp listener: %q", err)
+						logger.Debugf("Cannot write to local service: %q", err)
 						udpFwdConn.Close()
 						remoteUdpConnections.Delete(remoteUdpAddrStr)
-						continue
 					}
 				}
 			}(mapping)
