@@ -258,6 +258,13 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 
 	y.ctx, y.cancel = context.WithCancel(context.Background())
 
+	// Generate self-signed certificate if not already present
+	if y.config.Certificate == nil {
+		if err := y.config.GenerateSelfSignedCertificate(); err != nil {
+			return fmt.Errorf("failed to generate certificate: %w", err)
+		}
+	}
+
 	// Setup the Yggdrasil core
 	var err error
 	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
