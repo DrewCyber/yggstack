@@ -243,6 +243,23 @@ func (y *Yggstack) GetPeers() (string, error) {
 	return string(bs), nil
 }
 
+// GetPeersJSON returns detailed information about connected peers as JSON
+func (y *Yggstack) GetPeersJSON() (string, error) {
+	y.mu.RLock()
+	defer y.mu.RUnlock()
+
+	if y.core == nil {
+		return "[]", fmt.Errorf("core not initialized")
+	}
+
+	peersInfo := y.core.GetPeers()
+	bs, err := json.Marshal(peersInfo)
+	if err != nil {
+		return "[]", fmt.Errorf("failed to marshal peers info: %w", err)
+	}
+	return string(bs), nil
+}
+
 // Start starts the Yggstack node with optional SOCKS listener and nameserver
 func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 	y.mu.Lock()
@@ -425,6 +442,178 @@ func (y *Yggstack) IsRunning() bool {
 	y.mu.RLock()
 	defer y.mu.RUnlock()
 	return y.isRunning
+}
+
+// AddLocalTCPMapping adds a TCP mapping from local address to remote Yggdrasil address
+// Format: localAddr="127.0.0.1:8080", remoteAddr="[200:1234::1]:8080"
+func (y *Yggstack) AddLocalTCPMapping(localAddr, remoteAddr string) error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	localTCPAddr, err := net.ResolveTCPAddr("tcp", localAddr)
+	if err != nil {
+		return fmt.Errorf("invalid local TCP address %s: %w", localAddr, err)
+	}
+
+	remoteTCPAddr, err := net.ResolveTCPAddr("tcp", remoteAddr)
+	if err != nil {
+		return fmt.Errorf("invalid remote TCP address %s: %w", remoteAddr, err)
+	}
+
+	mapping := types.TCPMapping{
+		Listen: localTCPAddr,
+		Mapped: remoteTCPAddr,
+	}
+
+	y.localTCPMappings = append(y.localTCPMappings, mapping)
+
+	// If already running, start the mapping handler
+	if y.isRunning {
+		go y.handleLocalTCPMapping(mapping)
+	}
+
+	y.logger.Infof("Added local TCP mapping: %s -> %s", localAddr, remoteAddr)
+	return nil
+}
+
+// AddLocalUDPMapping adds a UDP mapping from local address to remote Yggdrasil address
+// Format: localAddr="127.0.0.1:5353", remoteAddr="[200:1234::1]:53"
+func (y *Yggstack) AddLocalUDPMapping(localAddr, remoteAddr string) error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
+	if err != nil {
+		return fmt.Errorf("invalid local UDP address %s: %w", localAddr, err)
+	}
+
+	remoteUDPAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		return fmt.Errorf("invalid remote UDP address %s: %w", remoteAddr, err)
+	}
+
+	mapping := types.UDPMapping{
+		Listen: localUDPAddr,
+		Mapped: remoteUDPAddr,
+	}
+
+	y.localUDPMappings = append(y.localUDPMappings, mapping)
+
+	// If already running, start the mapping handler
+	if y.isRunning {
+		go y.handleLocalUDPMapping(mapping)
+	}
+
+	y.logger.Infof("Added local UDP mapping: %s -> %s", localAddr, remoteAddr)
+	return nil
+}
+
+// AddRemoteTCPMapping adds a TCP mapping to expose local port on Yggdrasil network
+// Format: remotePort=8080, localAddr="127.0.0.1:80"
+func (y *Yggstack) AddRemoteTCPMapping(remotePort int, localAddr string) error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	if y.config == nil {
+		return fmt.Errorf("config not loaded")
+	}
+
+	localTCPAddr, err := net.ResolveTCPAddr("tcp", localAddr)
+	if err != nil {
+		return fmt.Errorf("invalid local TCP address %s: %w", localAddr, err)
+	}
+
+	// Get our Yggdrasil address
+	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	addr := address.AddrForKey(publicKey)
+	ip := net.IP(addr[:])
+
+	remoteTCPAddr := &net.TCPAddr{
+		IP:   ip,
+		Port: remotePort,
+	}
+
+	mapping := types.TCPMapping{
+		Listen: remoteTCPAddr,
+		Mapped: localTCPAddr,
+	}
+
+	y.remoteTCPMappings = append(y.remoteTCPMappings, mapping)
+
+	// If already running, start the mapping handler
+	if y.isRunning {
+		go y.handleRemoteTCPMapping(mapping)
+	}
+
+	y.logger.Infof("Added remote TCP mapping: [%s]:%d -> %s", ip, remotePort, localAddr)
+	return nil
+}
+
+// AddRemoteUDPMapping adds a UDP mapping to expose local port on Yggdrasil network
+// Format: remotePort=53, localAddr="127.0.0.1:53"
+func (y *Yggstack) AddRemoteUDPMapping(remotePort int, localAddr string) error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	if y.config == nil {
+		return fmt.Errorf("config not loaded")
+	}
+
+	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
+	if err != nil {
+		return fmt.Errorf("invalid local UDP address %s: %w", localAddr, err)
+	}
+
+	// Get our Yggdrasil address
+	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	addr := address.AddrForKey(publicKey)
+	ip := net.IP(addr[:])
+
+	remoteUDPAddr := &net.UDPAddr{
+		IP:   ip,
+		Port: remotePort,
+	}
+
+	mapping := types.UDPMapping{
+		Listen: remoteUDPAddr,
+		Mapped: localUDPAddr,
+	}
+
+	y.remoteUDPMappings = append(y.remoteUDPMappings, mapping)
+
+	// If already running, start the mapping handler
+	if y.isRunning {
+		go y.handleRemoteUDPMapping(mapping)
+	}
+
+	y.logger.Infof("Added remote UDP mapping: [%s]:%d -> %s", ip, remotePort, localAddr)
+	return nil
+}
+
+// ClearLocalMappings clears all local (forward) port mappings
+func (y *Yggstack) ClearLocalMappings() error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	y.localTCPMappings = nil
+	y.localUDPMappings = nil
+
+	y.logger.Infof("Cleared all local port mappings")
+	return nil
+}
+
+// ClearRemoteMappings clears all remote (expose) port mappings
+func (y *Yggstack) ClearRemoteMappings() error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	y.remoteTCPMappings = nil
+	y.remoteUDPMappings = nil
+
+	y.logger.Infof("Cleared all remote port mappings")
+	return nil
 }
 
 // Helper functions for port mapping handlers
