@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gologme/log"
 	"github.com/hjson/hjson-go/v4"
@@ -47,8 +48,9 @@ type Yggstack struct {
 	remoteUDPMappings []types.UDPMapping
 
 	// State
-	isRunning bool
-	mu        sync.RWMutex
+	isRunning  bool
+	handlersWg sync.WaitGroup // Wait group for handler goroutines
+	mu         sync.RWMutex
 }
 
 // LogWriter implements io.Writer for Android logging
@@ -386,21 +388,25 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 
 	// Setup local TCP mappings
 	for _, mapping := range y.localTCPMappings {
+		y.handlersWg.Add(1)
 		go y.handleLocalTCPMapping(mapping)
 	}
 
 	// Setup local UDP mappings
 	for _, mapping := range y.localUDPMappings {
+		y.handlersWg.Add(1)
 		go y.handleLocalUDPMapping(mapping)
 	}
 
 	// Setup remote TCP mappings
 	for _, mapping := range y.remoteTCPMappings {
+		y.handlersWg.Add(1)
 		go y.handleRemoteTCPMapping(mapping)
 	}
 
 	// Setup remote UDP mappings
 	for _, mapping := range y.remoteUDPMappings {
+		y.handlersWg.Add(1)
 		go y.handleRemoteUDPMapping(mapping)
 	}
 
@@ -412,9 +418,9 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 // Stop stops the Yggstack node
 func (y *Yggstack) Stop() error {
 	y.mu.Lock()
-	defer y.mu.Unlock()
 
 	if !y.isRunning {
+		y.mu.Unlock()
 		return fmt.Errorf("Yggstack is not running")
 	}
 
@@ -426,6 +432,18 @@ func (y *Yggstack) Stop() error {
 		y.socks5Tcp.Close()
 		y.socks5Tcp = nil
 	}
+
+	// Release lock before waiting for handlers
+	y.mu.Unlock()
+
+	// Wait for all handler goroutines to finish
+	y.logger.Infof("Waiting for handlers to stop...")
+	y.handlersWg.Wait()
+	y.logger.Infof("All handlers stopped")
+
+	// Reacquire lock for final cleanup
+	y.mu.Lock()
+	defer y.mu.Unlock()
 
 	if y.core != nil {
 		y.core.Stop()
@@ -618,6 +636,16 @@ func (y *Yggstack) ClearRemoteMappings() error {
 
 // Helper functions for port mapping handlers
 func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
+	defer y.handlersWg.Done()
+
+	// Check if context is already cancelled before starting
+	select {
+	case <-y.ctx.Done():
+		y.logger.Infof("Context cancelled before starting TCP mapping handler for %s", mapping.Listen)
+		return
+	default:
+	}
+
 	listener, err := net.ListenTCP("tcp", mapping.Listen)
 	if err != nil {
 		y.logger.Errorf("Failed to listen on local TCP %s: %s", mapping.Listen, err)
@@ -628,13 +656,27 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 	y.logger.Infof("Mapping local TCP port %d to Yggdrasil %s", mapping.Listen.Port, mapping.Mapped)
 
 	for {
+		// Set a short deadline to allow periodic context checks
+		listener.SetDeadline(time.Now().Add(1 * time.Second))
+
 		select {
 		case <-y.ctx.Done():
+			y.logger.Infof("Stopping TCP mapping handler for port %d", mapping.Listen.Port)
 			return
 		default:
 			c, err := listener.Accept()
 			if err != nil {
-				continue
+				// Check if it's a timeout error (expected) or real error
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				// For other errors, just continue unless context is done
+				select {
+				case <-y.ctx.Done():
+					return
+				default:
+					continue
+				}
 			}
 
 			r, err := y.netstack.DialTCP(mapping.Mapped)
@@ -650,6 +692,16 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 }
 
 func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
+	defer y.handlersWg.Done()
+
+	// Check if context is already cancelled before starting
+	select {
+	case <-y.ctx.Done():
+		y.logger.Infof("Context cancelled before starting UDP mapping handler for %s", mapping.Listen)
+		return
+	default:
+	}
+
 	mtu := y.core.MTU()
 	udpListenConn, err := net.ListenUDP("udp", mapping.Listen)
 	if err != nil {
@@ -664,13 +716,27 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 	udpBuffer := make([]byte, mtu)
 
 	for {
+		// Set deadline for periodic context checks
+		udpListenConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+
 		select {
 		case <-y.ctx.Done():
+			y.logger.Infof("Stopping UDP mapping handler for port %d", mapping.Listen.Port)
 			return
 		default:
 			bytesRead, remoteUdpAddr, err := udpListenConn.ReadFrom(udpBuffer)
 			if err != nil {
-				continue
+				// Check if it's a timeout (expected) or real error
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				// For other errors, check context
+				select {
+				case <-y.ctx.Done():
+					return
+				default:
+					continue
+				}
 			}
 
 			key := remoteUdpAddr.String()
@@ -697,6 +763,16 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 }
 
 func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
+	defer y.handlersWg.Done()
+
+	// Check if context is already cancelled before starting
+	select {
+	case <-y.ctx.Done():
+		y.logger.Infof("Context cancelled before starting remote TCP mapping handler for %s", mapping.Listen)
+		return
+	default:
+	}
+
 	listener, err := y.netstack.ListenTCP(mapping.Listen)
 	if err != nil {
 		y.logger.Errorf("Failed to listen on remote TCP %s: %s", mapping.Listen, err)
@@ -729,6 +805,16 @@ func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
 }
 
 func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
+	defer y.handlersWg.Done()
+
+	// Check if context is already cancelled before starting
+	select {
+	case <-y.ctx.Done():
+		y.logger.Infof("Context cancelled before starting remote UDP mapping handler for %s", mapping.Listen)
+		return
+	default:
+	}
+
 	mtu := y.core.MTU()
 	udpListenConn, err := y.netstack.ListenUDP(mapping.Listen)
 	if err != nil {
