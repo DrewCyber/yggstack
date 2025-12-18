@@ -262,6 +262,26 @@ func (y *Yggstack) GetPeersJSON() (string, error) {
 	return string(bs), nil
 }
 
+// RetryPeersNow forces immediate reconnection attempt for all peers
+// This should be called when network connectivity changes (e.g., WiFi <-> Cellular)
+func (y *Yggstack) RetryPeersNow() error {
+	y.mu.RLock()
+	defer y.mu.RUnlock()
+
+	if !y.isRunning {
+		return fmt.Errorf("Yggstack is not running")
+	}
+
+	if y.core == nil {
+		return fmt.Errorf("core not initialized")
+	}
+
+	y.logger.Infof("Forcing immediate peer retry...")
+	y.core.RetryPeersNow()
+	y.logger.Infof("RetryPeersNow() completed - peers should reconnect immediately")
+	return nil
+}
+
 // Start starts the Yggstack node with optional SOCKS listener and nameserver
 func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 	y.mu.Lock()
@@ -657,7 +677,7 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 
 	for {
 		// Set a short deadline to allow periodic context checks
-		listener.SetDeadline(time.Now().Add(1 * time.Second))
+		listener.SetDeadline(time.Now().Add(100 * time.Millisecond))
 
 		select {
 		case <-y.ctx.Done():
@@ -717,7 +737,7 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 
 	for {
 		// Set deadline for periodic context checks
-		udpListenConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		udpListenConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 
 		select {
 		case <-y.ctx.Done():
