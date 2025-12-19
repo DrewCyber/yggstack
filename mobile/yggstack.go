@@ -465,10 +465,28 @@ func (y *Yggstack) Stop() error {
 	y.mu.Lock()
 	defer y.mu.Unlock()
 
+	if y.admin != nil {
+		y.admin.Stop()
+		y.admin = nil
+	}
+
+	if y.multicast != nil {
+		y.multicast.Stop()
+		y.multicast = nil
+	}
+
+	if y.netstack != nil {
+		// Netstack uses gvisor stack which doesn't need explicit cleanup
+		// It will be garbage collected once no references remain
+		y.netstack = nil
+	}
+
 	if y.core != nil {
 		y.core.Stop()
 		y.core = nil
 	}
+
+	y.socks5Server = nil
 
 	y.isRunning = false
 	y.logger.Infof("Yggstack stopped")
