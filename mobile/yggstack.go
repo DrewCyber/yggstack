@@ -47,6 +47,10 @@ type Yggstack struct {
 	remoteTCPMappings []types.TCPMapping
 	remoteUDPMappings []types.UDPMapping
 
+	// Active connections tracking for cleanup
+	activeConns   []net.Conn
+	activeConnsMu sync.Mutex
+
 	// State
 	isRunning  bool
 	handlersWg sync.WaitGroup // Wait group for handler goroutines
@@ -453,13 +457,26 @@ func (y *Yggstack) Stop() error {
 		y.socks5Tcp = nil
 	}
 
+	// Close all active proxy connections to unblock handlers
+	y.closeAllConnections()
+
 	// Release lock before waiting for handlers
 	y.mu.Unlock()
 
-	// Wait for all handler goroutines to finish
+	// Wait for all handler goroutines to finish with timeout
 	y.logger.Infof("Waiting for handlers to stop...")
-	y.handlersWg.Wait()
-	y.logger.Infof("All handlers stopped")
+	done := make(chan struct{})
+	go func() {
+		y.handlersWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		y.logger.Infof("All handlers stopped")
+	case <-time.After(5 * time.Second):
+		y.logger.Warnf("Timeout waiting for handlers to stop, forcing shutdown")
+	}
 
 	// Reacquire lock for final cleanup
 	y.mu.Lock()
@@ -491,6 +508,26 @@ func (y *Yggstack) Stop() error {
 	y.isRunning = false
 	y.logger.Infof("Yggstack stopped")
 	return nil
+}
+
+// trackConnection adds a connection to the active connections list
+func (y *Yggstack) trackConnection(conn net.Conn) {
+	y.activeConnsMu.Lock()
+	defer y.activeConnsMu.Unlock()
+	y.activeConns = append(y.activeConns, conn)
+}
+
+// closeAllConnections forcefully closes all tracked connections
+func (y *Yggstack) closeAllConnections() {
+	y.activeConnsMu.Lock()
+	conns := y.activeConns
+	y.activeConns = nil
+	y.activeConnsMu.Unlock()
+
+	for _, conn := range conns {
+		conn.Close()
+	}
+	y.logger.Infof("Closed %d active connections", len(conns))
 }
 
 // IsRunning returns whether Yggstack is currently running
@@ -525,6 +562,7 @@ func (y *Yggstack) AddLocalTCPMapping(localAddr, remoteAddr string) error {
 
 	// If already running, start the mapping handler
 	if y.isRunning {
+		y.handlersWg.Add(1)
 		go y.handleLocalTCPMapping(mapping)
 	}
 
@@ -557,6 +595,7 @@ func (y *Yggstack) AddLocalUDPMapping(localAddr, remoteAddr string) error {
 
 	// If already running, start the mapping handler
 	if y.isRunning {
+		y.handlersWg.Add(1)
 		go y.handleLocalUDPMapping(mapping)
 	}
 
@@ -599,6 +638,7 @@ func (y *Yggstack) AddRemoteTCPMapping(remotePort int, localAddr string) error {
 
 	// If already running, start the mapping handler
 	if y.isRunning {
+		y.handlersWg.Add(1)
 		go y.handleRemoteTCPMapping(mapping)
 	}
 
@@ -641,6 +681,7 @@ func (y *Yggstack) AddRemoteUDPMapping(remotePort int, localAddr string) error {
 
 	// If already running, start the mapping handler
 	if y.isRunning {
+		y.handlersWg.Add(1)
 		go y.handleRemoteUDPMapping(mapping)
 	}
 
@@ -724,6 +765,10 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 				continue
 			}
 
+			// Track both connections for cleanup
+			y.trackConnection(c)
+			y.trackConnection(r)
+
 			go types.ProxyTCP(y.core.MTU(), c, r)
 		}
 	}
@@ -790,6 +835,9 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 				}
 				localUdpConnections.Store(key, yggdrasilConn)
 
+				// Track the connection for cleanup
+				y.trackConnection(yggdrasilConn.(net.Conn))
+
 				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, yggdrasilConn.(net.Conn))
 			}
 
@@ -836,6 +884,10 @@ func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
 				c.Close()
 				continue
 			}
+
+			// Track both connections for cleanup
+			y.trackConnection(c)
+			y.trackConnection(r)
 
 			go types.ProxyTCP(y.core.MTU(), c, r)
 		}
@@ -888,6 +940,9 @@ func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
 					continue
 				}
 				localUdpConnections.Store(key, localConn)
+
+				// Track the connection for cleanup
+				y.trackConnection(localConn)
 
 				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, localConn)
 			}
