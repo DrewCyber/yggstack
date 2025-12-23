@@ -77,19 +77,33 @@ if [ -d "$OUTPUT_DIR/$AAR_NAME.aar" ]; then
     rm -rf "$OUTPUT_DIR"/*
 fi
 
+# Detect build environment
+# CI environment (GitHub Actions, etc.) builds production/release version
+# Local development builds debug version with symbols
+if [ -n "$CI" ] || [ -n "$GITHUB_ACTIONS" ]; then
+    BUILD_TYPE="release"
+    LDFLAGS="-s -w -checklinkname=0"
+    echo -e "${GREEN}Building RELEASE version (symbols stripped)${NC}"
+else
+    BUILD_TYPE="debug"
+    LDFLAGS="-checklinkname=0"
+    echo -e "${YELLOW}Building DEBUG version (with symbols)${NC}"
+fi
+
 # Build for Android
 echo -e "${YELLOW}Building Android AAR library...${NC}"
+echo "Build type: $BUILD_TYPE"
 echo "Package: $PACKAGE_NAME"
 echo "Min SDK: $MIN_SDK"
 echo "Architectures: arm64, arm, amd64, 386"
+echo "LDFLAGS: $LDFLAGS"
 echo ""
-echo -e "${YELLOW}Note: Using -ldflags=\"-checklinkname=0\" for Go 1.23+ compatibility${NC}"
 
 gomobile bind \
     -target=android \
     -androidapi=$MIN_SDK \
     -javapkg="$PACKAGE_NAME" \
-    -ldflags="-checklinkname=0" \
+    -ldflags="$LDFLAGS" \
     -o="$OUTPUT_DIR/$AAR_NAME.aar" \
     ./mobile
 
