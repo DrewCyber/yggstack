@@ -95,12 +95,12 @@ func (y *Yggstack) SetLogLevel(level string) {
 	switch strings.ToLower(level) {
 	case "error":
 		y.logger.EnableLevel("error")
-		y.logger.EnableLevel("warn")
-		y.logger.EnableLevel("info")
 	case "warn":
+		y.logger.EnableLevel("error")
 		y.logger.EnableLevel("warn")
-		y.logger.EnableLevel("info")
 	case "info":
+		y.logger.EnableLevel("error")
+		y.logger.EnableLevel("warn")
 		y.logger.EnableLevel("info")
 	case "debug":
 		y.logger.EnableLevel("error")
