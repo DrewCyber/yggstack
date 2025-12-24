@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"regexp"
@@ -50,6 +51,10 @@ type Yggstack struct {
 	// Active connections tracking for cleanup
 	activeConns   []net.Conn
 	activeConnsMu sync.Mutex
+
+	// Active listeners tracking for cleanup (TCP listeners and UDP conns)
+	activeListeners   []io.Closer
+	activeListenersMu sync.Mutex
 
 	// State
 	isRunning  bool
@@ -457,6 +462,9 @@ func (y *Yggstack) Stop() error {
 		y.socks5Tcp = nil
 	}
 
+	// Close all active listeners first to stop accepting new connections
+	y.closeAllListeners()
+
 	// Close all active proxy connections to unblock handlers
 	y.closeAllConnections()
 
@@ -515,6 +523,25 @@ func (y *Yggstack) trackConnection(conn net.Conn) {
 	y.activeConnsMu.Lock()
 	defer y.activeConnsMu.Unlock()
 	y.activeConns = append(y.activeConns, conn)
+}
+
+func (y *Yggstack) trackListener(listener io.Closer) {
+	y.activeListenersMu.Lock()
+	defer y.activeListenersMu.Unlock()
+	y.activeListeners = append(y.activeListeners, listener)
+}
+
+// closeAllListeners forcefully closes all tracked listeners
+func (y *Yggstack) closeAllListeners() {
+	y.activeListenersMu.Lock()
+	listeners := y.activeListeners
+	y.activeListeners = nil
+	y.activeListenersMu.Unlock()
+
+	for _, listener := range listeners {
+		listener.Close()
+	}
+	y.logger.Infof("Closed %d active listeners", len(listeners))
 }
 
 // closeAllConnections forcefully closes all tracked connections
@@ -732,6 +759,9 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 	}
 	defer listener.Close()
 
+	// Track listener for forced cleanup on stop
+	y.trackListener(listener)
+
 	y.logger.Infof("Mapping local TCP port %d to Yggdrasil %s", mapping.Listen.Port, mapping.Mapped)
 
 	for {
@@ -792,6 +822,9 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 		return
 	}
 	defer udpListenConn.Close()
+
+	// Track listener for forced cleanup on stop
+	y.trackListener(udpListenConn)
 
 	y.logger.Infof("Mapping local UDP port %d to Yggdrasil %s", mapping.Listen.Port, mapping.Mapped)
 
@@ -866,6 +899,9 @@ func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
 	}
 	defer listener.Close()
 
+	// Track listener for forced cleanup on stop
+	y.trackListener(listener)
+
 	y.logger.Infof("Exposing local TCP %s on Yggdrasil port %d", mapping.Mapped, mapping.Listen.Port)
 
 	for {
@@ -912,6 +948,9 @@ func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
 		return
 	}
 	defer udpListenConn.Close()
+
+	// Track listener for forced cleanup on stop
+	y.trackListener(udpListenConn)
 
 	y.logger.Infof("Exposing local UDP %s on Yggdrasil port %d", mapping.Mapped, mapping.Listen.Port)
 
