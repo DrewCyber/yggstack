@@ -57,9 +57,11 @@ type Yggstack struct {
 	activeListenersMu sync.Mutex
 
 	// State
-	isRunning  bool
-	handlersWg sync.WaitGroup // Wait group for handler goroutines
-	mu         sync.RWMutex
+	isRunning    bool
+	cachedAddr   string         // Cached address to avoid lock contention
+	cachedSubnet string         // Cached subnet to avoid lock contention
+	handlersWg   sync.WaitGroup // Wait group for handler goroutines
+	mu           sync.RWMutex
 }
 
 // LogWriter implements io.Writer for Android logging
@@ -147,42 +149,37 @@ func (y *Yggstack) LoadConfigJSON(configJSON string) error {
 
 	cfg.AdminListen = "none"
 	y.config = cfg
+
+	// Cache address and subnet to avoid lock contention during rapid start/stop
+	// These are derived from the private key and never change
+	if cfg.PrivateKey != nil {
+		privateKey := ed25519.PrivateKey(cfg.PrivateKey)
+		publicKey := privateKey.Public().(ed25519.PublicKey)
+		addr := address.AddrForKey(publicKey)
+		subnet := address.SubnetForKey(publicKey)
+		y.cachedAddr = net.IP(addr[:]).String()
+		y.cachedSubnet = net.IP(subnet[:]).String() + "/64"
+	}
+
 	return nil
 }
 
 // GetAddress returns the IPv6 address for this node
+// Uses cached value to avoid lock contention during rapid start/stop cycles
 func (y *Yggstack) GetAddress() (string, error) {
-	y.mu.RLock()
-	defer y.mu.RUnlock()
-
-	if y.config == nil {
+	if y.cachedAddr == "" {
 		return "", fmt.Errorf("config not loaded")
 	}
-
-	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
-	addr := address.AddrForKey(publicKey)
-	ip := net.IP(addr[:])
-	return ip.String(), nil
+	return y.cachedAddr, nil
 }
 
 // GetSubnet returns the IPv6 subnet for this node
+// Uses cached value to avoid lock contention during rapid start/stop cycles
 func (y *Yggstack) GetSubnet() (string, error) {
-	y.mu.RLock()
-	defer y.mu.RUnlock()
-
-	if y.config == nil {
+	if y.cachedSubnet == "" {
 		return "", fmt.Errorf("config not loaded")
 	}
-
-	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
-	snet := address.SubnetForKey(publicKey)
-	ipnet := net.IPNet{
-		IP:   append(snet[:], 0, 0, 0, 0, 0, 0, 0, 0),
-		Mask: net.CIDRMask(len(snet)*8, 128),
-	}
-	return ipnet.String(), nil
+	return y.cachedSubnet, nil
 }
 
 // GetPublicKey returns the public key for this node
