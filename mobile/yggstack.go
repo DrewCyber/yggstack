@@ -62,6 +62,10 @@ type Yggstack struct {
 	cachedSubnet string         // Cached subnet to avoid lock contention
 	handlersWg   sync.WaitGroup // Wait group for handler goroutines
 	mu           sync.RWMutex
+
+	// Activity callback for low power mode
+	activityCallback ActivityCallback
+	activityMu       sync.RWMutex
 }
 
 // LogWriter implements io.Writer for Android logging
@@ -72,6 +76,13 @@ type LogWriter struct {
 // LogCallback is called when logs are generated
 type LogCallback interface {
 	OnLog(message string)
+}
+
+// ActivityCallback is called when connection activity occurs (for low power mode)
+type ActivityCallback interface {
+	OnConnectionCreated(connId string, protocol string)
+	OnDataTransferred(connId string, bytesRx int64, bytesTx int64)
+	OnConnectionClosed(connId string)
 }
 
 func (w *LogWriter) Write(p []byte) (n int, err error) {
@@ -115,6 +126,40 @@ func (y *Yggstack) SetLogLevel(level string) {
 		y.logger.EnableLevel("info")
 		y.logger.EnableLevel("debug")
 		y.logger.EnableLevel("trace")
+	}
+}
+
+// SetActivityCallback sets the callback for connection activity monitoring (low power mode)
+func (y *Yggstack) SetActivityCallback(callback ActivityCallback) {
+	y.activityMu.Lock()
+	defer y.activityMu.Unlock()
+	y.activityCallback = callback
+}
+
+// notifyConnectionCreated notifies about new connection
+func (y *Yggstack) notifyConnectionCreated(connId string, protocol string) {
+	y.activityMu.RLock()
+	defer y.activityMu.RUnlock()
+	if y.activityCallback != nil {
+		y.activityCallback.OnConnectionCreated(connId, protocol)
+	}
+}
+
+// notifyDataTransferred notifies about data transfer
+func (y *Yggstack) notifyDataTransferred(connId string, bytesRx int64, bytesTx int64) {
+	y.activityMu.RLock()
+	defer y.activityMu.RUnlock()
+	if y.activityCallback != nil {
+		y.activityCallback.OnDataTransferred(connId, bytesRx, bytesTx)
+	}
+}
+
+// notifyConnectionClosed notifies about connection closure
+func (y *Yggstack) notifyConnectionClosed(connId string) {
+	y.activityMu.RLock()
+	defer y.activityMu.RUnlock()
+	if y.activityCallback != nil {
+		y.activityCallback.OnConnectionClosed(connId)
 	}
 }
 
@@ -384,8 +429,27 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 
 	// Start SOCKS server if requested
 	if socksAddress != "" {
+		// Create a dial wrapper that tracks activity
+		dialWrapper := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := y.netstack.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			// Generate connection ID and notify
+			connId := fmt.Sprintf("socks-%s-%d", addr, time.Now().UnixNano())
+			y.notifyConnectionCreated(connId, "SOCKS")
+
+			// Wrap connection to track activity
+			return &trackedConn{
+				Conn:   conn,
+				connId: connId,
+				ygg:    y,
+			}, nil
+		}
+
 		socksOptions := []socks5.Option{
-			socks5.WithDial(y.netstack.DialContext),
+			socks5.WithDial(dialWrapper),
 		}
 
 		if nameserver != "" {
@@ -796,7 +860,15 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 			y.trackConnection(c)
 			y.trackConnection(r)
 
-			go types.ProxyTCP(y.core.MTU(), c, r)
+			// Generate connection ID and notify
+			connId := fmt.Sprintf("tcp-%s-%d", c.RemoteAddr().String(), time.Now().UnixNano())
+			y.notifyConnectionCreated(connId, "TCP")
+
+			// Proxy with activity tracking
+			go func(connId string, c1, c2 net.Conn) {
+				defer y.notifyConnectionClosed(connId)
+				y.proxyTCPWithTracking(connId, c1, c2)
+			}(connId, c, r)
 		}
 	}
 }
@@ -868,7 +940,20 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 				// Track the connection for cleanup
 				y.trackConnection(yggdrasilConn.(net.Conn))
 
-				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, yggdrasilConn.(net.Conn))
+				// Generate connection ID and notify
+				connId := fmt.Sprintf("udp-%s-%d", key, time.Now().UnixNano())
+				localUdpConnections.Store(key+"_connid", connId)
+				y.notifyConnectionCreated(connId, "UDP")
+
+				go func(connId string) {
+					types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, yggdrasilConn.(net.Conn))
+					y.notifyConnectionClosed(connId)
+				}(connId)
+			}
+
+			// Notify activity on each packet
+			if connIdVal, ok := localUdpConnections.Load(key + "_connid"); ok {
+				y.notifyDataTransferred(connIdVal.(string), int64(bytesRead), 0)
 			}
 
 			if _, err := yggdrasilConn.(net.Conn).Write(udpBuffer[:bytesRead]); err != nil {
@@ -922,7 +1007,15 @@ func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
 			y.trackConnection(c)
 			y.trackConnection(r)
 
-			go types.ProxyTCP(y.core.MTU(), c, r)
+			// Generate connection ID and notify
+			connId := fmt.Sprintf("tcp-remote-%s-%d", c.RemoteAddr().String(), time.Now().UnixNano())
+			y.notifyConnectionCreated(connId, "TCP")
+
+			// Proxy with activity tracking
+			go func(connId string, c1, c2 net.Conn) {
+				defer y.notifyConnectionClosed(connId)
+				y.proxyTCPWithTracking(connId, c1, c2)
+			}(connId, c, r)
 		}
 	}
 }
@@ -988,4 +1081,88 @@ func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
 			}
 		}
 	}
+}
+
+// proxyTCPWithTracking proxies TCP with activity tracking for low power mode
+func (y *Yggstack) proxyTCPWithTracking(connId string, c1, c2 net.Conn) {
+	mtu := y.core.MTU()
+
+	// Start proxying in both directions
+	errCh := make(chan error, 2)
+
+	go func() {
+		errCh <- y.tcpProxyFuncWithTracking(connId, mtu, c1, c2, true)
+	}()
+
+	go func() {
+		errCh <- y.tcpProxyFuncWithTracking(connId, mtu, c2, c1, false)
+	}()
+
+	// Wait for either direction to complete
+	for i := 0; i < 2; i++ {
+		<-errCh
+	}
+
+	c1.Close()
+	c2.Close()
+}
+
+// tcpProxyFuncWithTracking proxies data with activity tracking
+func (y *Yggstack) tcpProxyFuncWithTracking(connId string, mtu uint64, dst, src net.Conn, isForward bool) error {
+	buf := make([]byte, mtu)
+	for {
+		n, err := src.Read(buf[:])
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			// Notify activity based on direction
+			if isForward {
+				y.notifyDataTransferred(connId, int64(n), 0)
+			} else {
+				y.notifyDataTransferred(connId, 0, int64(n))
+			}
+
+			n, err = dst.Write(buf[:n])
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// trackedConn wraps a net.Conn to track data transfer for activity monitoring
+type trackedConn struct {
+	net.Conn
+	connId string
+	ygg    *Yggstack
+	closed bool
+	mu     sync.Mutex
+}
+
+func (tc *trackedConn) Read(b []byte) (n int, err error) {
+	n, err = tc.Conn.Read(b)
+	if n > 0 {
+		tc.ygg.notifyDataTransferred(tc.connId, int64(n), 0)
+	}
+	return
+}
+
+func (tc *trackedConn) Write(b []byte) (n int, err error) {
+	n, err = tc.Conn.Write(b)
+	if n > 0 {
+		tc.ygg.notifyDataTransferred(tc.connId, 0, int64(n))
+	}
+	return
+}
+
+func (tc *trackedConn) Close() error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	if !tc.closed {
+		tc.closed = true
+		tc.ygg.notifyConnectionClosed(tc.connId)
+	}
+	return tc.Conn.Close()
 }
