@@ -457,16 +457,34 @@ func (y *Yggstack) Stop() error {
 		y.cancel()
 	}
 
+	// Close SOCKS5 listener with deadline to prevent hanging
 	if y.socks5Tcp != nil {
+		// Set deadline before closing to unblock any Accept() calls
+		if tcpListener, ok := y.socks5Tcp.(*net.TCPListener); ok {
+			tcpListener.SetDeadline(time.Now())
+		}
 		y.socks5Tcp.Close()
 		y.socks5Tcp = nil
+		y.logger.Infof("SOCKS5 listener closed")
 	}
 
 	// Close all active listeners first to stop accepting new connections
 	y.closeAllListeners()
 
 	// Close all active proxy connections to unblock handlers
-	y.closeAllConnections()
+	// Run with timeout to prevent hanging on stuck connections
+	closeConnsDone := make(chan struct{})
+	go func() {
+		y.closeAllConnections()
+		close(closeConnsDone)
+	}()
+
+	select {
+	case <-closeConnsDone:
+		y.logger.Infof("Connections closed successfully")
+	case <-time.After(2 * time.Second):
+		y.logger.Warnf("WARNING: Timeout closing connections after 2 seconds - forcing continuation")
+	}
 
 	// Release lock before waiting for handlers
 	y.mu.Unlock()
@@ -482,7 +500,7 @@ func (y *Yggstack) Stop() error {
 	select {
 	case <-done:
 		y.logger.Infof("All handlers stopped")
-	case <-time.After(5 * time.Second):
+	case <-time.After(3 * time.Second):
 		y.logger.Warnf("Timeout waiting for handlers to stop, forcing shutdown")
 	}
 
@@ -538,6 +556,18 @@ func (y *Yggstack) closeAllListeners() {
 	y.activeListeners = nil
 	y.activeListenersMu.Unlock()
 
+	// Set deadlines on listeners that support it before closing
+	deadline := time.Now()
+	for _, listener := range listeners {
+		// Try to set deadline if the listener type supports it
+		if tcpListener, ok := listener.(*net.TCPListener); ok {
+			tcpListener.SetDeadline(deadline)
+		} else if udpConn, ok := listener.(*net.UDPConn); ok {
+			udpConn.SetDeadline(deadline)
+		}
+	}
+
+	// Now close all listeners
 	for _, listener := range listeners {
 		listener.Close()
 	}
@@ -551,6 +581,24 @@ func (y *Yggstack) closeAllConnections() {
 	y.activeConns = nil
 	y.activeConnsMu.Unlock()
 
+	// Set aggressive deadlines on all connections BEFORE closing
+	// This forces any blocked Read()/Write() operations to timeout immediately
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for _, conn := range conns {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetDeadline(deadline)
+		} else if udpConn, ok := conn.(*net.UDPConn); ok {
+			udpConn.SetDeadline(deadline)
+		} else {
+			// For other connection types, try setting deadline via generic interface
+			conn.SetDeadline(deadline)
+		}
+	}
+
+	// Small delay to allow deadlines to trigger
+	time.Sleep(150 * time.Millisecond)
+
+	// Now close all connections - they should close quickly
 	for _, conn := range conns {
 		conn.Close()
 	}
