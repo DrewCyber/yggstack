@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -60,6 +59,9 @@ type Yggstack struct {
 	isRunning  bool
 	handlersWg sync.WaitGroup // Wait group for handler goroutines
 	mu         sync.RWMutex
+
+	// Callback for peer state changes
+	peerCallback PeerChangeCallback
 }
 
 // LogWriter implements io.Writer for Android logging
@@ -70,6 +72,11 @@ type LogWriter struct {
 // LogCallback is called when logs are generated
 type LogCallback interface {
 	OnLog(message string)
+}
+
+// PeerChangeCallback is called when peer connection state changes
+type PeerChangeCallback interface {
+	OnPeerCountChanged(connected int64, total int64)
 }
 
 func (w *LogWriter) Write(p []byte) (n int, err error) {
@@ -83,7 +90,7 @@ func (w *LogWriter) Write(p []byte) (n int, err error) {
 func NewYggstack() *Yggstack {
 	return &Yggstack{
 		isRunning: false,
-		logger:    log.New(os.Stdout, "", log.Flags()),
+		logger:    log.New(io.Discard, "", log.Flags()),
 	}
 }
 
@@ -291,6 +298,45 @@ func (y *Yggstack) RetryPeersNow() error {
 	return nil
 }
 
+// SetPeerChangeCallback sets the callback for peer connection state changes
+func (y *Yggstack) SetPeerChangeCallback(callback PeerChangeCallback) {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+	y.peerCallback = callback
+}
+
+// TriggerPeerUpdate manually triggers the peer change callback with current peer counts
+// This should be called after Start() completes to get the initial peer state
+func (y *Yggstack) TriggerPeerUpdate() {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Silently recover from panic
+			}
+		}()
+
+		y.mu.RLock()
+		callback := y.peerCallback
+		core := y.core
+		y.mu.RUnlock()
+
+		if callback == nil || core == nil {
+			return
+		}
+
+		peers := core.GetPeers()
+
+		connected := 0
+		for _, p := range peers {
+			if p.Up {
+				connected++
+			}
+		}
+
+		callback.OnPeerCountChanged(int64(connected), int64(len(peers)))
+	}()
+}
+
 // Start starts the Yggstack node with optional SOCKS listener and nameserver
 func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 	y.mu.Lock()
@@ -345,6 +391,15 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 
 	if y.core, err = core.New(y.config.Certificate, y.logger, options...); err != nil {
 		return fmt.Errorf("failed to create core: %w", err)
+	}
+
+	// Set up peer change callback immediately after core creation
+	// This ensures we get notifications for any peer state changes
+	if y.peerCallback != nil {
+		y.core.SetPeerChangeCallback(func(connected int, total int) {
+			// Convert to int64 for gomobile compatibility
+			y.peerCallback.OnPeerCountChanged(int64(connected), int64(total))
+		})
 	}
 
 	address, subnet := y.core.Address(), y.core.Subnet()

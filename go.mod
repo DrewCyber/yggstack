@@ -27,3 +27,6 @@ require (
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 )
+
+// Use local yggdrasil-go with peer callback changes
+replace github.com/yggdrasil-network/yggdrasil-go => ../yggdrasil-go
