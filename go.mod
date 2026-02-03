@@ -8,7 +8,8 @@ require (
 	github.com/hjson/hjson-go/v4 v4.5.0
 	github.com/quic-go/quic-go v0.59.0
 	github.com/things-go/go-socks5 v0.0.5
-	github.com/yggdrasil-network/yggdrasil-go v0.5.13-0.20260118191231-9184cd23e5df
+	github.com/yggdrasil-network/yggdrasil-go v0.5.13-RC.1
+	golang.org/x/mobile v0.0.0-20260203041319-574ceaa2f723
 	gvisor.dev/gvisor v0.0.0-20240810013311-326fe0f2a77f
 )
 
@@ -21,7 +22,6 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.47.0 // indirect
-	golang.org/x/mobile v0.0.0-20241108191957-fa514ef75a0f // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
