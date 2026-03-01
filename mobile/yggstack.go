@@ -876,6 +876,9 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 
 	y.logger.Infof("Mapping local UDP port %d to Yggdrasil %s", mapping.Listen.Port, mapping.Mapped)
 
+	// localUdpConnections maps client address string → active *gonet.UDPConn to Yggdrasil.
+	// Only the main dispatch loop below reads from udpListenConn; per-session goroutines
+	// only read from the per-session yggdrasil conn and write back to udpListenConn.
 	localUdpConnections := new(sync.Map)
 	udpBuffer := make([]byte, mtu)
 
@@ -904,26 +907,53 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 			}
 
 			key := remoteUdpAddr.String()
-			var yggdrasilConn interface{}
 
 			if conn, ok := localUdpConnections.Load(key); ok {
-				yggdrasilConn = conn
+				// Existing session: forward the packet to the yggdrasil connection.
+				yggConn := conn.(net.Conn)
+				if _, err := yggConn.Write(udpBuffer[:bytesRead]); err != nil {
+					y.logger.Errorf("Failed to write to yggdrasil UDP connection for %s: %s", key, err)
+					// Tear down the dead session; the response forwarder goroutine
+					// will exit on its own when it reads the error from yggConn.
+					localUdpConnections.Delete(key)
+					yggConn.Close()
+				}
 			} else {
-				yggdrasilConn, err = y.netstack.DialUDP(mapping.Mapped)
+				// New session: open a dedicated yggdrasil UDP connection.
+				yggConn, err := y.netstack.DialUDP(mapping.Mapped)
 				if err != nil {
 					y.logger.Errorf("Failed to dial UDP %s: %s", mapping.Mapped, err)
 					continue
 				}
-				localUdpConnections.Store(key, yggdrasilConn)
 
-				// Track the connection for cleanup
-				y.trackConnection(yggdrasilConn.(net.Conn))
+				localUdpConnections.Store(key, yggConn)
+				// Track for forced closure during Stop().
+				y.trackConnection(yggConn)
 
-				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, yggdrasilConn.(net.Conn))
-			}
+				// Forward the first client packet to yggdrasil.
+				if _, err := yggConn.Write(udpBuffer[:bytesRead]); err != nil {
+					y.logger.Errorf("Failed to write first packet to yggdrasil UDP connection: %s", err)
+					localUdpConnections.Delete(key)
+					yggConn.Close()
+					continue
+				}
 
-			if _, err := yggdrasilConn.(net.Conn).Write(udpBuffer[:bytesRead]); err != nil {
-				y.logger.Errorf("Failed to write to UDP connection: %s", err)
+				// Capture loop variables for the goroutine closure.
+				capturedKey := key
+				capturedConn := yggConn
+				capturedAddr := remoteUdpAddr
+
+				// Start a one-directional response forwarder:
+				//   yggdrasil conn → udpListenConn @ client address
+				//
+				// Crucially, this goroutine:
+				//   • only reads from capturedConn (never from udpListenConn)
+				//   • never closes udpListenConn
+				//   • removes its own session from the map on exit
+				go types.ForwardUDPResponse(mtu, udpListenConn, capturedAddr, capturedConn, func() {
+					localUdpConnections.Delete(capturedKey)
+					capturedConn.Close()
+				})
 			}
 		}
 	}
@@ -1002,6 +1032,9 @@ func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
 
 	y.logger.Infof("Exposing local UDP %s on Yggdrasil port %d", mapping.Mapped, mapping.Listen.Port)
 
+	// localUdpConnections maps remote Yggdrasil address string → *net.UDPConn to local target.
+	// Only the main dispatch loop reads from udpListenConn; per-session goroutines only
+	// read from the per-session local conn and write back to udpListenConn.
 	localUdpConnections := new(sync.Map)
 	udpBuffer := make([]byte, mtu)
 
@@ -1016,26 +1049,45 @@ func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
 			}
 
 			key := remoteUdpAddr.String()
-			var localConn *net.UDPConn
 
 			if conn, ok := localUdpConnections.Load(key); ok {
-				localConn = conn.(*net.UDPConn)
+				// Existing session: forward the packet to the local UDP target.
+				localConn := conn.(*net.UDPConn)
+				if _, err := localConn.Write(udpBuffer[:bytesRead]); err != nil {
+					y.logger.Errorf("Failed to write to local UDP connection for %s: %s", key, err)
+					localUdpConnections.Delete(key)
+					localConn.Close()
+				}
 			} else {
-				localConn, err = net.DialUDP("udp", nil, mapping.Mapped)
+				// New session: dial the local UDP target.
+				localConn, err := net.DialUDP("udp", nil, mapping.Mapped)
 				if err != nil {
 					y.logger.Errorf("Failed to dial local UDP %s: %s", mapping.Mapped, err)
 					continue
 				}
-				localUdpConnections.Store(key, localConn)
 
-				// Track the connection for cleanup
+				localUdpConnections.Store(key, localConn)
+				// Track for forced closure during Stop().
 				y.trackConnection(localConn)
 
-				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, localConn)
-			}
+				// Forward the first Yggdrasil packet to the local target.
+				if _, err := localConn.Write(udpBuffer[:bytesRead]); err != nil {
+					y.logger.Errorf("Failed to write first packet to local UDP connection: %s", err)
+					localUdpConnections.Delete(key)
+					localConn.Close()
+					continue
+				}
 
-			if _, err := localConn.Write(udpBuffer[:bytesRead]); err != nil {
-				y.logger.Errorf("Failed to write to local UDP connection: %s", err)
+				capturedKey := key
+				capturedConn := localConn
+				capturedAddr := remoteUdpAddr
+
+				// One-directional response forwarder:
+				//   local target conn → udpListenConn @ remote Yggdrasil address
+				go types.ForwardUDPResponse(mtu, udpListenConn, capturedAddr, capturedConn, func() {
+					localUdpConnections.Delete(capturedKey)
+					capturedConn.Close()
+				})
 			}
 		}
 	}
