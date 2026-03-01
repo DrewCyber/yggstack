@@ -525,8 +525,22 @@ func (y *Yggstack) Stop() error {
 	}
 
 	if y.core != nil {
-		y.core.Stop()
+		// core.Stop() can block for several seconds closing broken peer connections.
+		// Run it in a goroutine with a hard timeout so a stuck core cannot prevent
+		// the Android service from restarting cleanly after a network switch.
+		coreStopped := make(chan struct{})
+		core := y.core
 		y.core = nil
+		go func() {
+			core.Stop()
+			close(coreStopped)
+		}()
+		select {
+		case <-coreStopped:
+			y.logger.Infof("core stopped")
+		case <-time.After(4 * time.Second):
+			y.logger.Warnf("core.Stop() timed out after 4s - forcing continuation")
+		}
 	}
 
 	y.socks5Server = nil
