@@ -392,24 +392,17 @@ func main() {
 				udpBuffer := make([]byte, mtu)
 				for {
 					bytesRead, remoteUdpAddr, err := udpListenConn.ReadFrom(udpBuffer)
-					if err != nil || bytesRead == 0 {
-						continue
+					if err != nil {
+						if bytesRead == 0 {
+							continue
+						}
 					}
 
 					remoteUdpAddrStr := remoteUdpAddr.String()
 
-					if connVal, ok := localUdpConnections.Load(remoteUdpAddrStr); ok {
-						// Existing session: forward this client packet to the yggdrasil conn.
-						udpSession := connVal.(*UDPSession)
-						udpFwdConnPtr := udpSession.conn.(*gonet.UDPConn)
-						udpFwdConn := *udpFwdConnPtr
-						if _, err = udpFwdConn.Write(udpBuffer[:bytesRead]); err != nil {
-							logger.Debugf("Cannot write to yggdrasil conn: %q", err)
-							udpFwdConn.Close()
-							localUdpConnections.Delete(remoteUdpAddrStr)
-						}
-					} else {
-						// New session: dial, send first packet, start response forwarder.
+					connVal, ok := localUdpConnections.Load(remoteUdpAddrStr)
+
+					if !ok {
 						logger.Debugf("Creating new session for %s", remoteUdpAddr.String())
 						udpFwdConn, err := s.DialUDP(mapping.Mapped)
 						if err != nil {
@@ -421,22 +414,23 @@ func main() {
 							remoteAddr: remoteUdpAddr,
 						}
 						localUdpConnections.Store(remoteUdpAddrStr, udpSession)
+						go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, udpFwdConn)
+					}
 
-						udpFwdConnPtr := udpFwdConn
-						if _, err := udpFwdConnPtr.Write(udpBuffer[:bytesRead]); err != nil {
-							logger.Debugf("Cannot write first packet to yggdrasil conn: %q", err)
-							udpFwdConnPtr.Close()
-							localUdpConnections.Delete(remoteUdpAddrStr)
-							continue
-						}
+					udpSession, ok := connVal.(*UDPSession)
+					if !ok {
+						continue
+					}
 
-						capturedKey := remoteUdpAddrStr
-						capturedConn := udpFwdConn
-						capturedAddr := remoteUdpAddr
-						go types.ForwardUDPResponse(mtu, udpListenConn, capturedAddr, capturedConn, func() {
-							localUdpConnections.Delete(capturedKey)
-							capturedConn.Close()
-						})
+					udpFwdConnPtr := udpSession.conn.(*gonet.UDPConn)
+					udpFwdConn := *udpFwdConnPtr
+
+					_, err = udpFwdConn.Write(udpBuffer[:bytesRead])
+					if err != nil {
+						logger.Debugf("Cannot write from yggdrasil to udp listener: %q", err)
+						udpFwdConn.Close()
+						localUdpConnections.Delete(remoteUdpAddrStr)
+						continue
 					}
 				}
 			}(mapping)
@@ -494,44 +488,40 @@ func main() {
 
 					remoteUdpAddrStr := remoteUdpAddr.String()
 
-					if connVal, ok := remoteUdpConnections.Load(remoteUdpAddrStr); ok {
-						// Existing session.
-						udpSession := connVal.(*UDPSession)
-						udpFwdConnPtr := udpSession.conn.(*net.UDPConn)
-						udpFwdConn := *udpFwdConnPtr
-						if _, err = udpFwdConn.Write(udpBuffer[:bytesRead]); err != nil {
-							logger.Debugf("Cannot write from yggdrasil to udp listener: %q", err)
-							udpFwdConn.Close()
-							remoteUdpConnections.Delete(remoteUdpAddrStr)
-						}
-					} else {
-						// New session: dial local target, send first packet, start response forwarder.
+					var udpSession *UDPSession = nil
+
+					connVal, ok := remoteUdpConnections.Load(remoteUdpAddrStr)
+
+					if !ok {
 						logger.Debugf("Creating new session for %s", remoteUdpAddr.String())
 						udpFwdConn, err := net.DialUDP("udp", nil, mapping.Mapped)
 						if err != nil {
 							logger.Errorf("Failed to connect to %s: %s", mapping.Mapped, err)
 							continue
 						}
-						udpSession := &UDPSession{
+						udpSession = &UDPSession{
 							conn:       udpFwdConn,
 							remoteAddr: remoteUdpAddr,
 						}
 						remoteUdpConnections.Store(remoteUdpAddrStr, udpSession)
+						go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, udpFwdConn)
+					} else {
+						udpSession, ok = connVal.(*UDPSession)
 
-						if _, err = udpFwdConn.Write(udpBuffer[:bytesRead]); err != nil {
-							logger.Debugf("Cannot write first packet to local udp conn: %q", err)
-							udpFwdConn.Close()
-							remoteUdpConnections.Delete(remoteUdpAddrStr)
+						if !ok {
 							continue
 						}
+					}
 
-						capturedKey := remoteUdpAddrStr
-						capturedConn := udpFwdConn
-						capturedAddr := remoteUdpAddr
-						go types.ForwardUDPResponse(mtu, udpListenConn, capturedAddr, capturedConn, func() {
-							remoteUdpConnections.Delete(capturedKey)
-							capturedConn.Close()
-						})
+					udpFwdConnPtr := udpSession.conn.(*net.UDPConn)
+					udpFwdConn := *udpFwdConnPtr
+
+					_, err = udpFwdConn.Write(udpBuffer[:bytesRead])
+					if err != nil {
+						logger.Debugf("Cannot write from yggdrasil to udp listener: %q", err)
+						udpFwdConn.Close()
+						remoteUdpConnections.Delete(remoteUdpAddrStr)
+						continue
 					}
 				}
 			}(mapping)
