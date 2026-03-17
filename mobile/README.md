@@ -18,7 +18,6 @@ Android bindings for Yggstack - Yggdrasil as SOCKS proxy without TUN interface.
 
 - **`yggstack.go`** - Main mobile bindings implementation
 - **`ANDROID.md`** - Complete Android integration guide with Kotlin examples
-- **`STATUS.md`** - Current implementation status and known issues
 
 ## Quick Start
 
@@ -81,24 +80,3 @@ yggstack.stop()
 ### Logging
 - `SetLogCallback(callback)` - Set log callback
 - `SetLogLevel(level)` - Set log level
-
-## Documentation
-
-- **[ANDROID.md](ANDROID.md)** - Complete Android integration guide
-- **[STATUS.md](STATUS.md)** - Implementation status and issues
-- **[../README.md](../README.md)** - Main Yggstack documentation
-
-## Current Status
-
-**Implementation: 70% complete**
-
-- ✅ Mobile bindings code is complete and tested
-- ✅ API is fully designed and documented
-- ✅ Build script is ready
-- ✅ AAR build is ready
-
-See `STATUS.md` for detailed information about the current issue and possible solutions.
-
-## License
-
-LGPLv3 - See LICENSE file for details.

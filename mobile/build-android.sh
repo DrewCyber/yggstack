@@ -5,6 +5,11 @@
 
 set -e
 
+# Resolve module root (one level up from this script's directory)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$ROOT_DIR"
+
 # Configuration
 PACKAGE_NAME="link.yggdrasil.yggstack"
 MIN_SDK=21
@@ -105,7 +110,7 @@ gomobile bind \
     -javapkg="$PACKAGE_NAME" \
     -ldflags="$LDFLAGS" \
     -o="$OUTPUT_DIR/$AAR_NAME.aar" \
-    ./mobile
+    ./mobile/
 
 # Check if build was successful
 if [ -f "$OUTPUT_DIR/$AAR_NAME.aar" ]; then
