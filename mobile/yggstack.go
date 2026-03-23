@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -269,6 +270,43 @@ func (y *Yggstack) GetPeersJSON() (string, error) {
 		return "[]", fmt.Errorf("failed to marshal peers info: %w", err)
 	}
 	return string(bs), nil
+}
+
+// AddLivePeer adds a peer to the running yggdrasil core without restarting.
+// peerURI should be a full URI, e.g. "tcp://host:port?maxbackoff=5s".
+// Returns an error if the node is not currently running.
+func (y *Yggstack) AddLivePeer(peerURI string) error {
+	y.mu.RLock()
+	defer y.mu.RUnlock()
+
+	if !y.isRunning || y.core == nil {
+		return fmt.Errorf("Yggstack is not running")
+	}
+
+	u, err := url.Parse(peerURI)
+	if err != nil {
+		return fmt.Errorf("invalid peer URI %q: %w", peerURI, err)
+	}
+	return y.core.AddPeer(u, "")
+}
+
+// RemoveLivePeer removes a peer from the running yggdrasil core without restarting.
+// peerURI should be a full URI matching what was passed when the peer was added,
+// e.g. "tcp://host:port?maxbackoff=5s".
+// Returns an error if the node is not currently running.
+func (y *Yggstack) RemoveLivePeer(peerURI string) error {
+	y.mu.RLock()
+	defer y.mu.RUnlock()
+
+	if !y.isRunning || y.core == nil {
+		return fmt.Errorf("Yggstack is not running")
+	}
+
+	u, err := url.Parse(peerURI)
+	if err != nil {
+		return fmt.Errorf("invalid peer URI %q: %w", peerURI, err)
+	}
+	return y.core.RemovePeer(u, "")
 }
 
 // RetryPeersNow forces immediate reconnection attempt for all peers
