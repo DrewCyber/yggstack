@@ -57,6 +57,10 @@ type Yggstack struct {
 	activeListeners   []io.Closer
 	activeListenersMu sync.Mutex
 
+	// Per-mapping context cancellation and listener references for on-the-fly enable/disable
+	mappingCancels   sync.Map // string key → context.CancelFunc
+	mappingListeners sync.Map // string key → io.Closer
+
 	// State
 	isRunning  bool
 	handlersWg sync.WaitGroup // Wait group for handler goroutines
@@ -86,6 +90,20 @@ func NewYggstack() *Yggstack {
 		isRunning: false,
 		logger:    log.New(os.Stdout, "", log.Flags()),
 	}
+}
+
+// Mapping key helpers (used for per-mapping cancel / listener tracking)
+func localTCPMappingKey(listenAddr, mappedAddr string) string {
+	return "ltcp:" + listenAddr + "->" + mappedAddr
+}
+func localUDPMappingKey(listenAddr, mappedAddr string) string {
+	return "ludp:" + listenAddr + "->" + mappedAddr
+}
+func remoteTCPMappingKey(remotePort int, localAddr string) string {
+	return fmt.Sprintf("rtcp:%d->%s", remotePort, localAddr)
+}
+func remoteUDPMappingKey(remotePort int, localAddr string) string {
+	return fmt.Sprintf("rudp:%d->%s", remotePort, localAddr)
 }
 
 // SetLogCallback sets custom log callback for Android
@@ -455,26 +473,38 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 
 	// Setup local TCP mappings
 	for _, mapping := range y.localTCPMappings {
+		key := localTCPMappingKey(mapping.Listen.String(), mapping.Mapped.String())
+		childCtx, cancel := context.WithCancel(y.ctx)
+		y.mappingCancels.Store(key, cancel)
 		y.handlersWg.Add(1)
-		go y.handleLocalTCPMapping(mapping)
+		go y.handleLocalTCPMappingCtx(childCtx, key, mapping)
 	}
 
 	// Setup local UDP mappings
 	for _, mapping := range y.localUDPMappings {
+		key := localUDPMappingKey(mapping.Listen.String(), mapping.Mapped.String())
+		childCtx, cancel := context.WithCancel(y.ctx)
+		y.mappingCancels.Store(key, cancel)
 		y.handlersWg.Add(1)
-		go y.handleLocalUDPMapping(mapping)
+		go y.handleLocalUDPMappingCtx(childCtx, key, mapping)
 	}
 
 	// Setup remote TCP mappings
 	for _, mapping := range y.remoteTCPMappings {
+		key := remoteTCPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
+		childCtx, cancel := context.WithCancel(y.ctx)
+		y.mappingCancels.Store(key, cancel)
 		y.handlersWg.Add(1)
-		go y.handleRemoteTCPMapping(mapping)
+		go y.handleRemoteTCPMappingCtx(childCtx, key, mapping)
 	}
 
 	// Setup remote UDP mappings
 	for _, mapping := range y.remoteUDPMappings {
+		key := remoteUDPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
+		childCtx, cancel := context.WithCancel(y.ctx)
+		y.mappingCancels.Store(key, cancel)
 		y.handlersWg.Add(1)
-		go y.handleRemoteUDPMapping(mapping)
+		go y.handleRemoteUDPMappingCtx(childCtx, key, mapping)
 	}
 
 	y.isRunning = true
@@ -583,6 +613,16 @@ func (y *Yggstack) Stop() error {
 
 	y.socks5Server = nil
 
+	// Clear per-mapping tracking maps
+	y.mappingCancels.Range(func(k, v any) bool {
+		y.mappingCancels.Delete(k)
+		return true
+	})
+	y.mappingListeners.Range(func(k, v any) bool {
+		y.mappingListeners.Delete(k)
+		return true
+	})
+
 	y.isRunning = false
 	y.logger.Infof("Yggstack stopped")
 	return nil
@@ -689,8 +729,11 @@ func (y *Yggstack) AddLocalTCPMapping(localAddr, remoteAddr string) error {
 
 	// If already running, start the mapping handler
 	if y.isRunning {
+		key := localTCPMappingKey(localTCPAddr.String(), remoteTCPAddr.String())
+		childCtx, cancel := context.WithCancel(y.ctx)
+		y.mappingCancels.Store(key, cancel)
 		y.handlersWg.Add(1)
-		go y.handleLocalTCPMapping(mapping)
+		go y.handleLocalTCPMappingCtx(childCtx, key, mapping)
 	}
 
 	y.logger.Infof("Added local TCP mapping: %s -> %s", localAddr, remoteAddr)
@@ -722,8 +765,11 @@ func (y *Yggstack) AddLocalUDPMapping(localAddr, remoteAddr string) error {
 
 	// If already running, start the mapping handler
 	if y.isRunning {
+		key := localUDPMappingKey(localUDPAddr.String(), remoteUDPAddr.String())
+		childCtx, cancel := context.WithCancel(y.ctx)
+		y.mappingCancels.Store(key, cancel)
 		y.handlersWg.Add(1)
-		go y.handleLocalUDPMapping(mapping)
+		go y.handleLocalUDPMappingCtx(childCtx, key, mapping)
 	}
 
 	y.logger.Infof("Added local UDP mapping: %s -> %s", localAddr, remoteAddr)
@@ -765,8 +811,11 @@ func (y *Yggstack) AddRemoteTCPMapping(remotePort int, localAddr string) error {
 
 	// If already running, start the mapping handler
 	if y.isRunning {
+		key := remoteTCPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
+		childCtx, cancel := context.WithCancel(y.ctx)
+		y.mappingCancels.Store(key, cancel)
 		y.handlersWg.Add(1)
-		go y.handleRemoteTCPMapping(mapping)
+		go y.handleRemoteTCPMappingCtx(childCtx, key, mapping)
 	}
 
 	y.logger.Infof("Added remote TCP mapping: [%s]:%d -> %s", ip, remotePort, localAddr)
@@ -808,8 +857,11 @@ func (y *Yggstack) AddRemoteUDPMapping(remotePort int, localAddr string) error {
 
 	// If already running, start the mapping handler
 	if y.isRunning {
+		key := remoteUDPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
+		childCtx, cancel := context.WithCancel(y.ctx)
+		y.mappingCancels.Store(key, cancel)
 		y.handlersWg.Add(1)
-		go y.handleRemoteUDPMapping(mapping)
+		go y.handleRemoteUDPMappingCtx(childCtx, key, mapping)
 	}
 
 	y.logger.Infof("Added remote UDP mapping: [%s]:%d -> %s", ip, remotePort, localAddr)
@@ -840,14 +892,143 @@ func (y *Yggstack) ClearRemoteMappings() error {
 	return nil
 }
 
-// Helper functions for port mapping handlers
-func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
-	defer y.handlersWg.Done()
+// RemoveLocalTCPMapping stops and removes a specific local TCP forward mapping.
+// Cancels the handler goroutine and closes its listener immediately.
+func (y *Yggstack) RemoveLocalTCPMapping(localAddr, remoteAddr string) error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
 
-	// Check if context is already cancelled before starting
+	localTCPAddr, err := net.ResolveTCPAddr("tcp", localAddr)
+	if err != nil {
+		return fmt.Errorf("invalid local TCP address %s: %w", localAddr, err)
+	}
+	remoteTCPAddr, err := net.ResolveTCPAddr("tcp", remoteAddr)
+	if err != nil {
+		return fmt.Errorf("invalid remote TCP address %s: %w", remoteAddr, err)
+	}
+
+	key := localTCPMappingKey(localTCPAddr.String(), remoteTCPAddr.String())
+	if v, ok := y.mappingCancels.LoadAndDelete(key); ok {
+		v.(context.CancelFunc)()
+	}
+	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
+		v.(io.Closer).Close()
+	}
+
+	newMappings := make([]types.TCPMapping, 0, len(y.localTCPMappings))
+	for _, m := range y.localTCPMappings {
+		if m.Listen.String() != localTCPAddr.String() || m.Mapped.String() != remoteTCPAddr.String() {
+			newMappings = append(newMappings, m)
+		}
+	}
+	y.localTCPMappings = newMappings
+
+	y.logger.Infof("Removed local TCP mapping: %s -> %s", localAddr, remoteAddr)
+	return nil
+}
+
+// RemoveLocalUDPMapping stops and removes a specific local UDP forward mapping.
+func (y *Yggstack) RemoveLocalUDPMapping(localAddr, remoteAddr string) error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
+	if err != nil {
+		return fmt.Errorf("invalid local UDP address %s: %w", localAddr, err)
+	}
+	remoteUDPAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		return fmt.Errorf("invalid remote UDP address %s: %w", remoteAddr, err)
+	}
+
+	key := localUDPMappingKey(localUDPAddr.String(), remoteUDPAddr.String())
+	if v, ok := y.mappingCancels.LoadAndDelete(key); ok {
+		v.(context.CancelFunc)()
+	}
+	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
+		v.(io.Closer).Close()
+	}
+
+	newMappings := make([]types.UDPMapping, 0, len(y.localUDPMappings))
+	for _, m := range y.localUDPMappings {
+		if m.Listen.String() != localUDPAddr.String() || m.Mapped.String() != remoteUDPAddr.String() {
+			newMappings = append(newMappings, m)
+		}
+	}
+	y.localUDPMappings = newMappings
+
+	y.logger.Infof("Removed local UDP mapping: %s -> %s", localAddr, remoteAddr)
+	return nil
+}
+
+// RemoveRemoteTCPMapping stops and removes a specific remote TCP expose mapping.
+func (y *Yggstack) RemoveRemoteTCPMapping(remotePort int, localAddr string) error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	localTCPAddr, err := net.ResolveTCPAddr("tcp", localAddr)
+	if err != nil {
+		return fmt.Errorf("invalid local TCP address %s: %w", localAddr, err)
+	}
+
+	key := remoteTCPMappingKey(remotePort, localTCPAddr.String())
+	if v, ok := y.mappingCancels.LoadAndDelete(key); ok {
+		v.(context.CancelFunc)()
+	}
+	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
+		v.(io.Closer).Close()
+	}
+
+	newMappings := make([]types.TCPMapping, 0, len(y.remoteTCPMappings))
+	for _, m := range y.remoteTCPMappings {
+		if m.Listen.Port != remotePort || m.Mapped.String() != localTCPAddr.String() {
+			newMappings = append(newMappings, m)
+		}
+	}
+	y.remoteTCPMappings = newMappings
+
+	y.logger.Infof("Removed remote TCP mapping: port %d -> %s", remotePort, localAddr)
+	return nil
+}
+
+// RemoveRemoteUDPMapping stops and removes a specific remote UDP expose mapping.
+func (y *Yggstack) RemoveRemoteUDPMapping(remotePort int, localAddr string) error {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+
+	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
+	if err != nil {
+		return fmt.Errorf("invalid local UDP address %s: %w", localAddr, err)
+	}
+
+	key := remoteUDPMappingKey(remotePort, localUDPAddr.String())
+	if v, ok := y.mappingCancels.LoadAndDelete(key); ok {
+		v.(context.CancelFunc)()
+	}
+	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
+		v.(io.Closer).Close()
+	}
+
+	newMappings := make([]types.UDPMapping, 0, len(y.remoteUDPMappings))
+	for _, m := range y.remoteUDPMappings {
+		if m.Listen.Port != remotePort || m.Mapped.String() != localUDPAddr.String() {
+			newMappings = append(newMappings, m)
+		}
+	}
+	y.remoteUDPMappings = newMappings
+
+	y.logger.Infof("Removed remote UDP mapping: port %d -> %s", remotePort, localAddr)
+	return nil
+}
+
+// Helper functions for port mapping handlers
+func (y *Yggstack) handleLocalTCPMappingCtx(ctx context.Context, key string, mapping types.TCPMapping) {
+	defer y.handlersWg.Done()
+	defer y.mappingListeners.Delete(key)
+	defer y.mappingCancels.Delete(key)
+
 	select {
-	case <-y.ctx.Done():
-		y.logger.Infof("Context cancelled before starting TCP mapping handler for %s", mapping.Listen)
+	case <-ctx.Done():
 		return
 	default:
 	}
@@ -859,29 +1040,26 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 	}
 	defer listener.Close()
 
-	// Track listener for forced cleanup on stop
 	y.trackListener(listener)
+	y.mappingListeners.Store(key, listener)
 
 	y.logger.Infof("Mapping local TCP port %d to Yggdrasil %s", mapping.Listen.Port, mapping.Mapped)
 
 	for {
-		// Set a short deadline to allow periodic context checks
 		listener.SetDeadline(time.Now().Add(100 * time.Millisecond))
 
 		select {
-		case <-y.ctx.Done():
+		case <-ctx.Done():
 			y.logger.Infof("Stopping TCP mapping handler for port %d", mapping.Listen.Port)
 			return
 		default:
 			c, err := listener.Accept()
 			if err != nil {
-				// Check if it's a timeout error (expected) or real error
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				// For other errors, just continue unless context is done
 				select {
-				case <-y.ctx.Done():
+				case <-ctx.Done():
 					return
 				default:
 					continue
@@ -895,7 +1073,6 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 				continue
 			}
 
-			// Track both connections for cleanup
 			y.trackConnection(c)
 			y.trackConnection(r)
 
@@ -904,13 +1081,13 @@ func (y *Yggstack) handleLocalTCPMapping(mapping types.TCPMapping) {
 	}
 }
 
-func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
+func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, mapping types.UDPMapping) {
 	defer y.handlersWg.Done()
+	defer y.mappingListeners.Delete(key)
+	defer y.mappingCancels.Delete(key)
 
-	// Check if context is already cancelled before starting
 	select {
-	case <-y.ctx.Done():
-		y.logger.Infof("Context cancelled before starting UDP mapping handler for %s", mapping.Listen)
+	case <-ctx.Done():
 		return
 	default:
 	}
@@ -923,8 +1100,8 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 	}
 	defer udpListenConn.Close()
 
-	// Track listener for forced cleanup on stop
 	y.trackListener(udpListenConn)
+	y.mappingListeners.Store(key, udpListenConn)
 
 	y.logger.Infof("Mapping local UDP port %d to Yggdrasil %s", mapping.Listen.Port, mapping.Mapped)
 
@@ -932,33 +1109,30 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 	udpBuffer := make([]byte, mtu)
 
 	for {
-		// Set deadline for periodic context checks
 		udpListenConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 
 		select {
-		case <-y.ctx.Done():
+		case <-ctx.Done():
 			y.logger.Infof("Stopping UDP mapping handler for port %d", mapping.Listen.Port)
 			return
 		default:
 			bytesRead, remoteUdpAddr, err := udpListenConn.ReadFrom(udpBuffer)
 			if err != nil {
-				// Check if it's a timeout (expected) or real error
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				// For other errors, check context
 				select {
-				case <-y.ctx.Done():
+				case <-ctx.Done():
 					return
 				default:
 					continue
 				}
 			}
 
-			key := remoteUdpAddr.String()
+			connKey := remoteUdpAddr.String()
 			var yggdrasilConn interface{}
 
-			if conn, ok := localUdpConnections.Load(key); ok {
+			if conn, ok := localUdpConnections.Load(connKey); ok {
 				yggdrasilConn = conn
 			} else {
 				yggdrasilConn, err = y.netstack.DialUDP(mapping.Mapped)
@@ -966,9 +1140,8 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 					y.logger.Errorf("Failed to dial UDP %s: %s", mapping.Mapped, err)
 					continue
 				}
-				localUdpConnections.Store(key, yggdrasilConn)
+				localUdpConnections.Store(connKey, yggdrasilConn)
 
-				// Track the connection for cleanup
 				y.trackConnection(yggdrasilConn.(net.Conn))
 
 				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, yggdrasilConn.(net.Conn))
@@ -981,13 +1154,13 @@ func (y *Yggstack) handleLocalUDPMapping(mapping types.UDPMapping) {
 	}
 }
 
-func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
+func (y *Yggstack) handleRemoteTCPMappingCtx(ctx context.Context, key string, mapping types.TCPMapping) {
 	defer y.handlersWg.Done()
+	defer y.mappingListeners.Delete(key)
+	defer y.mappingCancels.Delete(key)
 
-	// Check if context is already cancelled before starting
 	select {
-	case <-y.ctx.Done():
-		y.logger.Infof("Context cancelled before starting remote TCP mapping handler for %s", mapping.Listen)
+	case <-ctx.Done():
 		return
 	default:
 	}
@@ -999,19 +1172,24 @@ func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
 	}
 	defer listener.Close()
 
-	// Track listener for forced cleanup on stop
 	y.trackListener(listener)
+	y.mappingListeners.Store(key, listener)
 
 	y.logger.Infof("Exposing local TCP %s on Yggdrasil port %d", mapping.Mapped, mapping.Listen.Port)
 
 	for {
 		select {
-		case <-y.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 			c, err := listener.Accept()
 			if err != nil {
-				continue
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					continue
+				}
 			}
 
 			r, err := net.DialTCP("tcp", nil, mapping.Mapped)
@@ -1021,7 +1199,6 @@ func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
 				continue
 			}
 
-			// Track both connections for cleanup
 			y.trackConnection(c)
 			y.trackConnection(r)
 
@@ -1030,13 +1207,13 @@ func (y *Yggstack) handleRemoteTCPMapping(mapping types.TCPMapping) {
 	}
 }
 
-func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
+func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, mapping types.UDPMapping) {
 	defer y.handlersWg.Done()
+	defer y.mappingListeners.Delete(key)
+	defer y.mappingCancels.Delete(key)
 
-	// Check if context is already cancelled before starting
 	select {
-	case <-y.ctx.Done():
-		y.logger.Infof("Context cancelled before starting remote UDP mapping handler for %s", mapping.Listen)
+	case <-ctx.Done():
 		return
 	default:
 	}
@@ -1049,8 +1226,8 @@ func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
 	}
 	defer udpListenConn.Close()
 
-	// Track listener for forced cleanup on stop
 	y.trackListener(udpListenConn)
+	y.mappingListeners.Store(key, udpListenConn)
 
 	y.logger.Infof("Exposing local UDP %s on Yggdrasil port %d", mapping.Mapped, mapping.Listen.Port)
 
@@ -1059,18 +1236,23 @@ func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
 
 	for {
 		select {
-		case <-y.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 			bytesRead, remoteUdpAddr, err := udpListenConn.ReadFrom(udpBuffer)
 			if err != nil {
-				continue
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					continue
+				}
 			}
 
-			key := remoteUdpAddr.String()
+			connKey := remoteUdpAddr.String()
 			var localConn *net.UDPConn
 
-			if conn, ok := localUdpConnections.Load(key); ok {
+			if conn, ok := localUdpConnections.Load(connKey); ok {
 				localConn = conn.(*net.UDPConn)
 			} else {
 				localConn, err = net.DialUDP("udp", nil, mapping.Mapped)
@@ -1078,9 +1260,8 @@ func (y *Yggstack) handleRemoteUDPMapping(mapping types.UDPMapping) {
 					y.logger.Errorf("Failed to dial local UDP %s: %s", mapping.Mapped, err)
 					continue
 				}
-				localUdpConnections.Store(key, localConn)
+				localUdpConnections.Store(connKey, localConn)
 
-				// Track the connection for cleanup
 				y.trackConnection(localConn)
 
 				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, localConn)
