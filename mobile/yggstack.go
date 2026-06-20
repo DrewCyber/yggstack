@@ -399,6 +399,10 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 		options = append(options, core.AllowedPublicKey(k[:]))
 	}
 
+	if y.config.GroupPassword != "" {
+		options = append(options, core.GroupPassword(y.config.GroupPassword))
+	}
+
 	if y.core, err = core.New(y.config.Certificate, y.logger, options...); err != nil {
 		return fmt.Errorf("failed to create core: %w", err)
 	}
