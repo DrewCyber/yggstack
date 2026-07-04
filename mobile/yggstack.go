@@ -65,6 +65,10 @@ type Yggstack struct {
 	isRunning  bool
 	handlersWg sync.WaitGroup // Wait group for handler goroutines
 	mu         sync.RWMutex
+
+	// Peer event callback bridge for mobile bindings
+	peerEventCallback   PeerEventCallback
+	peerEventCallbackMu sync.RWMutex
 }
 
 // LogWriter implements io.Writer for Android logging
@@ -75,6 +79,18 @@ type LogWriter struct {
 // LogCallback is called when logs are generated
 type LogCallback interface {
 	OnLog(message string)
+}
+
+// PeerEventCallback is called when Yggdrasil peer state changes.
+// The payload is a JSON-encoded object containing event details and full peer snapshot.
+type PeerEventCallback interface {
+	OnPeerEvent(payload string)
+}
+
+type mobilePeerEvent struct {
+	EventType string          `json:"EventType"`
+	Changed   *core.PeerInfo  `json:"Changed,omitempty"`
+	Peers     []core.PeerInfo `json:"Peers"`
 }
 
 func (w *LogWriter) Write(p []byte) (n int, err error) {
@@ -112,6 +128,40 @@ func (y *Yggstack) SetLogCallback(callback LogCallback) {
 		writer := &LogWriter{callback: callback}
 		y.logger = log.New(writer, "", log.Flags())
 	}
+}
+
+// SetPeerEventCallback sets callback for peer state change events.
+// Passing nil disables callback delivery.
+func (y *Yggstack) SetPeerEventCallback(callback PeerEventCallback) {
+	y.peerEventCallbackMu.Lock()
+	y.peerEventCallback = callback
+	y.peerEventCallbackMu.Unlock()
+
+	// If core is already running, emit a snapshot immediately so callers can sync state.
+	y.mu.RLock()
+	runningCore := y.core
+	y.mu.RUnlock()
+	if runningCore != nil {
+		y.emitPeerEventJSON(mobilePeerEvent{
+			EventType: "snapshot",
+			Peers:     runningCore.GetPeers(),
+		})
+	}
+}
+
+func (y *Yggstack) emitPeerEventJSON(evt mobilePeerEvent) {
+	y.peerEventCallbackMu.RLock()
+	cb := y.peerEventCallback
+	y.peerEventCallbackMu.RUnlock()
+	if cb == nil {
+		return
+	}
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		y.logger.Warnf("Failed to marshal peer event: %v", err)
+		return
+	}
+	cb.OnPeerEvent(string(payload))
 }
 
 // SetLogLevel sets the logging level (info, warn, error, debug)
@@ -406,6 +456,19 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 	if y.core, err = core.New(y.config.Certificate, y.logger, options...); err != nil {
 		return fmt.Errorf("failed to create core: %w", err)
 	}
+	y.core.SetPeerNotify(func(evt core.PeerEvent) {
+		// Never block core internals on mobile callback consumers.
+		go y.emitPeerEventJSON(mobilePeerEvent{
+			EventType: string(evt.EventType),
+			Changed:   &evt.Changed,
+			Peers:     evt.Peers,
+		})
+	})
+	// Send initial state snapshot after callback hook is installed.
+	y.emitPeerEventJSON(mobilePeerEvent{
+		EventType: "snapshot",
+		Peers:     y.core.GetPeers(),
+	})
 
 	address, subnet := y.core.Address(), y.core.Subnet()
 	publicKey := privateKey.Public().(ed25519.PublicKey)
@@ -597,6 +660,7 @@ func (y *Yggstack) Stop() error {
 	}
 
 	if y.core != nil {
+		y.core.SetPeerNotify(nil)
 		// core.Stop() can block for several seconds closing broken peer connections.
 		// Run it in a goroutine with a hard timeout so a stuck core cannot prevent
 		// the Android service from restarting cleanly after a network switch.

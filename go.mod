@@ -32,3 +32,5 @@ require (
 )
 
 tool golang.org/x/mobile/cmd/gomobile
+
+replace github.com/yggdrasil-network/yggdrasil-go => ../yggdrasil-go
