@@ -30,13 +30,16 @@ echo -e "${GREEN}========================================${NC}"
 if ! command -v gomobile &> /dev/null; then
     echo -e "${RED}Error: gomobile is not installed${NC}"
     echo "Installing gomobile..."
-    go install golang.org/x/mobile/cmd/gomobile@latest
-    go install golang.org/x/mobile/cmd/gobind@latest
+    go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260203041319-574ceaa2f723
+    go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260203041319-574ceaa2f723
 fi
 
-# Initialize gomobile
-echo -e "${YELLOW}Initializing gomobile...${NC}"
-gomobile init
+# Prepare the gomobile toolchain directory.
+# Do not use `gomobile init`: it unconditionally installs gobind@latest, which
+# now requires Go >= 1.26. `gomobile bind` only needs this marker directory to
+# exist plus gobind on PATH (same as what init provides).
+echo -e "${YELLOW}Preparing gomobile toolchain...${NC}"
+mkdir -p "$(go env GOPATH)/pkg/gomobile"
 
 # Check if Android SDK/NDK is configured
 if [ -z "$ANDROID_HOME" ] && [ -z "$ANDROID_SDK_ROOT" ]; then
