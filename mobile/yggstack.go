@@ -39,6 +39,8 @@ type Yggstack struct {
 	socks5Server *socks5.Server
 	socks5Tcp    net.Listener
 	logger       *log.Logger
+	logWriter    io.Writer
+	logLevel     string
 	config       *config.NodeConfig
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -61,6 +63,10 @@ type Yggstack struct {
 	mappingCancels   sync.Map // string key → context.CancelFunc
 	mappingListeners sync.Map // string key → io.Closer
 
+	// Per-listener runtime stats (connection gauges, Yggdrasil-side RX/TX bytes),
+	// keyed like mappingCancels plus socksStatsKey for the SOCKS5 proxy
+	listenerStats sync.Map // string key → *listenerStats
+
 	// State
 	isRunning  bool
 	handlersWg sync.WaitGroup // Wait group for handler goroutines
@@ -70,6 +76,7 @@ type Yggstack struct {
 // LogWriter implements io.Writer for Android logging
 type LogWriter struct {
 	callback LogCallback
+	mu       sync.Mutex
 }
 
 // LogCallback is called when logs are generated
@@ -77,7 +84,13 @@ type LogCallback interface {
 	OnLog(message string)
 }
 
+// Write is shared by every per-subsystem *log.Logger built in buildLogger, so
+// without this lock the JNI callback could be entered concurrently from
+// multiple goroutines/OS threads (each logger only serializes against
+// itself, not against the others writing to the same callback).
 func (w *LogWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.callback != nil {
 		w.callback.OnLog(string(p))
 	}
@@ -86,10 +99,12 @@ func (w *LogWriter) Write(p []byte) (n int, err error) {
 
 // NewYggstack creates a new Yggstack instance
 func NewYggstack() *Yggstack {
-	return &Yggstack{
+	y := &Yggstack{
 		isRunning: false,
-		logger:    log.New(os.Stdout, "", log.Flags()),
+		logWriter: os.Stdout,
 	}
+	y.logger = y.buildLogger()
+	return y
 }
 
 // Mapping key helpers (used for per-mapping cancel / listener tracking)
@@ -109,30 +124,51 @@ func remoteUDPMappingKey(remotePort int, localAddr string) string {
 // SetLogCallback sets custom log callback for Android
 func (y *Yggstack) SetLogCallback(callback LogCallback) {
 	if callback != nil {
-		writer := &LogWriter{callback: callback}
-		y.logger = log.New(writer, "", log.Flags())
+		y.logWriter = &LogWriter{callback: callback}
+		y.logger = y.buildLogger()
+	}
+}
+
+// buildLogger returns a fresh golog Logger over the shared writer. Each
+// subsystem gets its own instance because gologme/log mutates per-instance
+// state (calldepth) without locking, so one instance must not be shared
+// across goroutines.
+func (y *Yggstack) buildLogger() *log.Logger {
+	w := y.logWriter
+	if w == nil {
+		w = os.Stdout
+	}
+	l := log.New(w, "", log.Flags())
+	y.applyLogLevel(l)
+	// Prewarm calldepth so its unsynchronized first-write cannot race later.
+	l.Infof("%s", "logger ready")
+	return l
+}
+
+func (y *Yggstack) applyLogLevel(l *log.Logger) {
+	switch strings.ToLower(y.logLevel) {
+	case "error":
+		l.EnableLevel("error")
+	case "warn":
+		l.EnableLevel("error")
+		l.EnableLevel("warn")
+	case "info":
+		l.EnableLevel("error")
+		l.EnableLevel("warn")
+		l.EnableLevel("info")
+	case "debug":
+		l.EnableLevel("error")
+		l.EnableLevel("warn")
+		l.EnableLevel("info")
+		l.EnableLevel("debug")
+		l.EnableLevel("trace")
 	}
 }
 
 // SetLogLevel sets the logging level (info, warn, error, debug)
 func (y *Yggstack) SetLogLevel(level string) {
-	switch strings.ToLower(level) {
-	case "error":
-		y.logger.EnableLevel("error")
-	case "warn":
-		y.logger.EnableLevel("error")
-		y.logger.EnableLevel("warn")
-	case "info":
-		y.logger.EnableLevel("error")
-		y.logger.EnableLevel("warn")
-		y.logger.EnableLevel("info")
-	case "debug":
-		y.logger.EnableLevel("error")
-		y.logger.EnableLevel("warn")
-		y.logger.EnableLevel("info")
-		y.logger.EnableLevel("debug")
-		y.logger.EnableLevel("trace")
-	}
+	y.logLevel = strings.ToLower(level)
+	y.applyLogLevel(y.logger)
 }
 
 // GenerateConfig generates a new random configuration and returns it as JSON string
@@ -362,6 +398,10 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 
 	y.ctx, y.cancel = context.WithCancel(context.Background())
 
+	// Stats always describe the current run only, even if a previous stop
+	// was aborted before the registry was cleared
+	y.resetListenerStats()
+
 	// Generate self-signed certificate if not already present
 	if y.config.Certificate == nil {
 		if err := y.config.GenerateSelfSignedCertificate(); err != nil {
@@ -403,7 +443,7 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 		options = append(options, core.GroupPassword(y.config.GroupPassword))
 	}
 
-	if y.core, err = core.New(y.config.Certificate, y.logger, options...); err != nil {
+	if y.core, err = core.New(y.config.Certificate, y.buildLogger(), options...); err != nil {
 		return fmt.Errorf("failed to create core: %w", err)
 	}
 
@@ -419,7 +459,7 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 	adminOptions := []admin.SetupOption{
 		admin.ListenAddress("none"),
 	}
-	if y.admin, err = admin.New(y.core, y.logger, adminOptions...); err != nil {
+	if y.admin, err = admin.New(y.core, y.buildLogger(), adminOptions...); err != nil {
 		return fmt.Errorf("failed to create admin: %w", err)
 	}
 
@@ -436,7 +476,7 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 		})
 	}
 
-	if y.multicast, err = multicast.New(y.core, y.logger, multicastOptions...); err != nil {
+	if y.multicast, err = multicast.New(y.core, y.buildLogger(), multicastOptions...); err != nil {
 		return fmt.Errorf("failed to create multicast: %w", err)
 	}
 
@@ -447,8 +487,18 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 
 	// Start SOCKS server if requested
 	if socksAddress != "" {
+		socksStats := y.getOrCreateListenerStats(socksStatsKey, "socks", socksAddress, "")
+		netstackDial := y.netstack.DialContext
 		socksOptions := []socks5.Option{
-			socks5.WithDial(y.netstack.DialContext),
+			socks5.WithDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := netstackDial(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				// The control connection already owns the gauges; this leg
+				// only feeds payload bytes into the counters
+				return wrapTrafficOnlyConn(conn, socksStats), nil
+			}),
 		}
 
 		if nameserver != "" {
@@ -469,7 +519,11 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 		}
 
 		go func() {
-			if err := y.socks5Server.Serve(y.socks5Tcp); err != nil {
+			var serveListener net.Listener = y.socks5Tcp
+			if listenerStatsWrappingEnabled {
+				serveListener = &countingListener{Listener: y.socks5Tcp, stats: socksStats}
+			}
+			if err := y.socks5Server.Serve(serveListener); err != nil {
 				y.logger.Errorf("SOCKS server error: %s", err)
 			}
 		}()
@@ -626,6 +680,9 @@ func (y *Yggstack) Stop() error {
 		y.mappingListeners.Delete(k)
 		return true
 	})
+
+	// Listener stats only describe the current run; drop them on stop
+	y.resetListenerStats()
 
 	y.isRunning = false
 	y.logger.Infof("Yggstack stopped")
@@ -918,6 +975,7 @@ func (y *Yggstack) RemoveLocalTCPMapping(localAddr, remoteAddr string) error {
 	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
 		v.(io.Closer).Close()
 	}
+	y.removeListenerStats(key)
 
 	newMappings := make([]types.TCPMapping, 0, len(y.localTCPMappings))
 	for _, m := range y.localTCPMappings {
@@ -952,6 +1010,7 @@ func (y *Yggstack) RemoveLocalUDPMapping(localAddr, remoteAddr string) error {
 	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
 		v.(io.Closer).Close()
 	}
+	y.removeListenerStats(key)
 
 	newMappings := make([]types.UDPMapping, 0, len(y.localUDPMappings))
 	for _, m := range y.localUDPMappings {
@@ -982,6 +1041,7 @@ func (y *Yggstack) RemoveRemoteTCPMapping(remotePort int, localAddr string) erro
 	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
 		v.(io.Closer).Close()
 	}
+	y.removeListenerStats(key)
 
 	newMappings := make([]types.TCPMapping, 0, len(y.remoteTCPMappings))
 	for _, m := range y.remoteTCPMappings {
@@ -1012,6 +1072,7 @@ func (y *Yggstack) RemoveRemoteUDPMapping(remotePort int, localAddr string) erro
 	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
 		v.(io.Closer).Close()
 	}
+	y.removeListenerStats(key)
 
 	newMappings := make([]types.UDPMapping, 0, len(y.remoteUDPMappings))
 	for _, m := range y.remoteUDPMappings {
@@ -1047,6 +1108,8 @@ func (y *Yggstack) handleLocalTCPMappingCtx(ctx context.Context, key string, map
 	y.trackListener(listener)
 	y.mappingListeners.Store(key, listener)
 
+	stats := y.getOrCreateListenerStats(key, "local-tcp", mapping.Listen.String(), mapping.Mapped.String())
+
 	y.logger.Infof("Mapping local TCP port %d to Yggdrasil %s", mapping.Listen.Port, mapping.Mapped)
 
 	for {
@@ -1077,10 +1140,11 @@ func (y *Yggstack) handleLocalTCPMappingCtx(ctx context.Context, key string, map
 				continue
 			}
 
+			rc := wrapCountingConn(r, stats)
 			y.trackConnection(c)
-			y.trackConnection(r)
+			y.trackConnection(rc)
 
-			go types.ProxyTCP(y.core.MTU(), c, r)
+			go types.ProxyTCP(y.core.MTU(), c, rc)
 		}
 	}
 }
@@ -1106,6 +1170,9 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 
 	y.trackListener(udpListenConn)
 	y.mappingListeners.Store(key, udpListenConn)
+
+	stats := y.getOrCreateListenerStats(key, "local-udp", mapping.Listen.String(), mapping.Mapped.String())
+	defer stats.sessionsEnded()
 
 	y.logger.Infof("Mapping local UDP port %d to Yggdrasil %s", mapping.Listen.Port, mapping.Mapped)
 
@@ -1139,11 +1206,14 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 			if conn, ok := localUdpConnections.Load(connKey); ok {
 				yggdrasilConn = conn
 			} else {
-				yggdrasilConn, err = y.netstack.DialUDP(mapping.Mapped)
-				if err != nil {
-					y.logger.Errorf("Failed to dial UDP %s: %s", mapping.Mapped, err)
+				raw, dialErr := y.netstack.DialUDP(mapping.Mapped)
+				if dialErr != nil {
+					y.logger.Errorf("Failed to dial UDP %s: %s", mapping.Mapped, dialErr)
 					continue
 				}
+				// Each remote client endpoint is one counted connection; the
+				// wrapper feeds both the reverse pump and the inline writes
+				yggdrasilConn = wrapCountingConn(raw, stats)
 				localUdpConnections.Store(connKey, yggdrasilConn)
 
 				y.trackConnection(yggdrasilConn.(net.Conn))
@@ -1179,6 +1249,8 @@ func (y *Yggstack) handleRemoteTCPMappingCtx(ctx context.Context, key string, ma
 	y.trackListener(listener)
 	y.mappingListeners.Store(key, listener)
 
+	stats := y.getOrCreateListenerStats(key, "remote-tcp", mapping.Listen.String(), mapping.Mapped.String())
+
 	y.logger.Infof("Exposing local TCP %s on Yggdrasil port %d", mapping.Mapped, mapping.Listen.Port)
 
 	for {
@@ -1203,10 +1275,11 @@ func (y *Yggstack) handleRemoteTCPMappingCtx(ctx context.Context, key string, ma
 				continue
 			}
 
-			y.trackConnection(c)
+			cc := wrapCountingConn(c, stats)
+			y.trackConnection(cc)
 			y.trackConnection(r)
 
-			go types.ProxyTCP(y.core.MTU(), c, r)
+			go types.ProxyTCP(y.core.MTU(), cc, r)
 		}
 	}
 }
@@ -1223,11 +1296,17 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, ma
 	}
 
 	mtu := y.core.MTU()
-	udpListenConn, err := y.netstack.ListenUDP(mapping.Listen)
+	stats := y.getOrCreateListenerStats(key, "remote-udp", mapping.Listen.String(), mapping.Mapped.String())
+	defer stats.sessionsEnded()
+
+	rawListenConn, err := y.netstack.ListenUDP(mapping.Listen)
 	if err != nil {
 		y.logger.Errorf("Failed to listen on remote UDP %s: %s", mapping.Listen, err)
 		return
 	}
+	// The socket is shared by all client sessions; the wrapper attributes
+	// every ReadFrom/WriteTo to this mapping's byte counters
+	udpListenConn := wrapCountingPacketConn(rawListenConn, stats)
 	defer udpListenConn.Close()
 
 	y.trackListener(udpListenConn)
@@ -1265,6 +1344,8 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, ma
 					continue
 				}
 				localUdpConnections.Store(connKey, localConn)
+
+				stats.connOpened()
 
 				y.trackConnection(localConn)
 

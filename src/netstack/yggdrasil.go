@@ -3,6 +3,7 @@ package netstack
 import (
 	"log"
 	"net"
+	"sync"
 
 	"github.com/yggdrasil-network/yggdrasil-go/src/core"
 	"github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
@@ -19,17 +20,23 @@ type YggdrasilNIC struct {
 	stack      *YggdrasilNetstack
 	ipv6rwc    *ipv6rwc.ReadWriteCloser
 	dispatcher stack.NetworkDispatcher
-	readBuf    []byte
-	writeBuf   []byte
 	rstPackets chan *stack.PacketBuffer
+
+	// writeBuf is reused across packets; WritePackets is invoked
+	// concurrently from several transport goroutines, so access is
+	// serialized. (A shared unguarded buffer here caused heap corruption.)
+	writeMu  sync.Mutex
+	writeBuf []byte
 }
 
 func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 	rwc := ipv6rwc.NewReadWriteCloser(ygg)
 	mtu := rwc.MTU()
+	rxPool := &sync.Pool{New: func() interface{} {
+		return make([]byte, mtu)
+	}}
 	nic := &YggdrasilNIC{
 		ipv6rwc:    rwc,
-		readBuf:    make([]byte, mtu),
 		writeBuf:   make([]byte, mtu),
 		rstPackets: make(chan *stack.PacketBuffer, 100),
 	}
@@ -37,16 +44,21 @@ func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 		return err
 	}
 	go func() {
-		var rx int
-		var err error
 		for {
-			rx, err = nic.ipv6rwc.Read(nic.readBuf)
+			// Scratch buffer is pooled; the delivered payload is a private
+			// copy because gvisor endpoints may retain views beyond this
+			// iteration, so the scratch memory must not be recycled early.
+			buf := rxPool.Get().([]byte)
+			rx, err := nic.ipv6rwc.Read(buf)
 			if err != nil {
 				log.Println(err)
 				break
 			}
+			payload := make([]byte, rx)
+			copy(payload, buf[:rx])
+			rxPool.Put(buf)
 			pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.MakeWithData(nic.readBuf[:rx]),
+				Payload: buffer.MakeWithData(payload),
 			})
 			nic.dispatcher.DeliverNetworkPacket(ipv6.ProtocolNumber, pkb)
 			pkb.DecRef()
@@ -122,13 +134,19 @@ func (e *YggdrasilNIC) writePacket(
 		if r != nil {
 		}
 	}()
+	// Serialize access to the reused write buffer; WritePackets is invoked
+	// concurrently from several transport goroutines.
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	vv := pkt.ToView()
+	if vv.Size() > len(e.writeBuf) {
+		e.writeBuf = make([]byte, vv.Size())
+	}
 	n, err := vv.Read(e.writeBuf)
 	if err != nil {
 		return &tcpip.ErrAborted{}
 	}
-	_, err = e.ipv6rwc.Write(e.writeBuf[:n])
-	if err != nil {
+	if _, err := e.ipv6rwc.Write(e.writeBuf[:n]); err != nil {
 		return &tcpip.ErrAborted{}
 	}
 	return nil
