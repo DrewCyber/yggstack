@@ -6,15 +6,22 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // socksStatsKey identifies the SOCKS5 proxy listener in the stats registry.
 const socksStatsKey = "socks"
 
 // listenerStatsWrappingEnabled toggles connection/byte instrumentation.
-// The relay stress test (stress_local_test.go) exercises these wrappers
-// under the race detector.
 var listenerStatsWrappingEnabled = true
+
+// udpSessionIdleTimeout is how long a UDP client endpoint can go quiet
+// before its session is expired and the active gauge decremented.
+const udpSessionIdleTimeout = 60 * time.Second
+
+// udpSweepInterval throttles how often a mapping handler scans its session
+// map for idle entries; it piggybacks on the handler's read-timeout loop.
+const udpSweepInterval = 5 * time.Second
 
 // wrapCountingConn counts bytes AND registers the connection in the
 // listener's active/total gauges. Use for relays representing one connection.
@@ -252,4 +259,43 @@ func (l *countingListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	return newCountingConn(conn, l.stats), nil
+}
+
+// udpSession tracks one client endpoint sharing a UDP mapping's socket, so
+// idle endpoints can be expired instead of accumulating for the mapping's
+// entire lifetime. conn is expected to already be wrapped with
+// wrapCountingConn, so closing it decrements the listener's active gauge.
+type udpSession struct {
+	conn       net.Conn
+	lastSeenNs atomic.Int64
+}
+
+func newUDPSession(conn net.Conn) *udpSession {
+	s := &udpSession{conn: conn}
+	s.touch()
+	return s
+}
+
+func (s *udpSession) touch() {
+	s.lastSeenNs.Store(time.Now().UnixNano())
+}
+
+func (s *udpSession) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, s.lastSeenNs.Load()))
+}
+
+// sweepIdleUDPSessions closes and forgets sessions that have been idle for
+// longer than udpSessionIdleTimeout. It is only safe to call from the same
+// goroutine that reads incoming packets for this session map, since that is
+// the only other place entries are inserted or touched.
+func sweepIdleUDPSessions(sessions *sync.Map, now time.Time) {
+	sessions.Range(func(key, value any) bool {
+		sess := value.(*udpSession)
+		if sess.idleFor(now) < udpSessionIdleTimeout {
+			return true
+		}
+		sessions.Delete(key)
+		sess.conn.Close()
+		return true
+	})
 }

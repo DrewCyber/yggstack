@@ -1178,6 +1178,7 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 
 	localUdpConnections := new(sync.Map)
 	udpBuffer := make([]byte, mtu)
+	nextSweep := time.Now().Add(udpSweepInterval)
 
 	for {
 		udpListenConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
@@ -1190,6 +1191,10 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 			bytesRead, remoteUdpAddr, err := udpListenConn.ReadFrom(udpBuffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if now := time.Now(); now.After(nextSweep) {
+						sweepIdleUDPSessions(localUdpConnections, now)
+						nextSweep = now.Add(udpSweepInterval)
+					}
 					continue
 				}
 				select {
@@ -1201,10 +1206,11 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 			}
 
 			connKey := remoteUdpAddr.String()
-			var yggdrasilConn interface{}
+			var sess *udpSession
 
-			if conn, ok := localUdpConnections.Load(connKey); ok {
-				yggdrasilConn = conn
+			if v, ok := localUdpConnections.Load(connKey); ok {
+				sess = v.(*udpSession)
+				sess.touch()
 			} else {
 				raw, dialErr := y.netstack.DialUDP(mapping.Mapped)
 				if dialErr != nil {
@@ -1213,15 +1219,16 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 				}
 				// Each remote client endpoint is one counted connection; the
 				// wrapper feeds both the reverse pump and the inline writes
-				yggdrasilConn = wrapCountingConn(raw, stats)
-				localUdpConnections.Store(connKey, yggdrasilConn)
+				wrapped := wrapCountingConn(raw, stats)
+				sess = newUDPSession(wrapped)
+				localUdpConnections.Store(connKey, sess)
 
-				y.trackConnection(yggdrasilConn.(net.Conn))
+				y.trackConnection(wrapped)
 
-				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, yggdrasilConn.(net.Conn))
+				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, wrapped)
 			}
 
-			if _, err := yggdrasilConn.(net.Conn).Write(udpBuffer[:bytesRead]); err != nil {
+			if _, err := sess.conn.Write(udpBuffer[:bytesRead]); err != nil {
 				y.logger.Errorf("Failed to write to UDP connection: %s", err)
 			}
 		}
@@ -1316,14 +1323,24 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, ma
 
 	localUdpConnections := new(sync.Map)
 	udpBuffer := make([]byte, mtu)
+	nextSweep := time.Now().Add(udpSweepInterval)
 
 	for {
+		udpListenConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+
 		select {
 		case <-ctx.Done():
 			return
 		default:
 			bytesRead, remoteUdpAddr, err := udpListenConn.ReadFrom(udpBuffer)
 			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if now := time.Now(); now.After(nextSweep) {
+						sweepIdleUDPSessions(localUdpConnections, now)
+						nextSweep = now.Add(udpSweepInterval)
+					}
+					continue
+				}
 				select {
 				case <-ctx.Done():
 					return
@@ -1333,26 +1350,29 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, ma
 			}
 
 			connKey := remoteUdpAddr.String()
-			var localConn *net.UDPConn
+			var sess *udpSession
 
-			if conn, ok := localUdpConnections.Load(connKey); ok {
-				localConn = conn.(*net.UDPConn)
+			if v, ok := localUdpConnections.Load(connKey); ok {
+				sess = v.(*udpSession)
+				sess.touch()
 			} else {
-				localConn, err = net.DialUDP("udp", nil, mapping.Mapped)
-				if err != nil {
-					y.logger.Errorf("Failed to dial local UDP %s: %s", mapping.Mapped, err)
+				localConn, dialErr := net.DialUDP("udp", nil, mapping.Mapped)
+				if dialErr != nil {
+					y.logger.Errorf("Failed to dial local UDP %s: %s", mapping.Mapped, dialErr)
 					continue
 				}
-				localUdpConnections.Store(connKey, localConn)
+				// Each remote client endpoint is one counted connection; the
+				// wrapper feeds both the reverse pump and the inline writes
+				wrapped := wrapCountingConn(localConn, stats)
+				sess = newUDPSession(wrapped)
+				localUdpConnections.Store(connKey, sess)
 
-				stats.connOpened()
+				y.trackConnection(wrapped)
 
-				y.trackConnection(localConn)
-
-				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, localConn)
+				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, wrapped)
 			}
 
-			if _, err := localConn.Write(udpBuffer[:bytesRead]); err != nil {
+			if _, err := sess.conn.Write(udpBuffer[:bytesRead]); err != nil {
 				y.logger.Errorf("Failed to write to local UDP connection: %s", err)
 			}
 		}
