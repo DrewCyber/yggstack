@@ -17,7 +17,11 @@ Android bindings for Yggstack - Yggdrasil as SOCKS proxy without TUN interface.
 ## Files
 
 - **`yggstack.go`** - Main mobile bindings implementation
-- **`ANDROID.md`** - Complete Android integration guide with Kotlin examples
+- **`stats.go`** - Traffic/port statistics exposed to the bindings
+- **`quic_check.go`** - QUIC support detection
+- **`build-android.sh`** - AAR build script (pinned gomobile, no `gomobile init`)
+- **`API_USAGE.md`** - Binding API reference and integration guide
+- **`BUILD_MODES.md`** - Debug vs release build behavior
 
 ## Quick Start
 
