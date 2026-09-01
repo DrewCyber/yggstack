@@ -1133,13 +1133,30 @@ func (y *Yggstack) handleLocalTCPMappingCtx(ctx context.Context, key string, map
 				}
 			}
 
-			r, err := y.netstack.DialTCP(mapping.Mapped)
+			// Count the connection from the moment it is accepted, not after
+			// the dial completes: the client is already parked on this socket,
+			// and an in-flight dial must register as activity (Power Save's
+			// idle detection watches ActiveConns) so the node is not powered
+			// down mid-handshake.
+			stats.activeConns.Add(1)
+
+			// Dial with a timeout bound to the handler context: without it an
+			// unreachable target left the dial blocking on the stack's ~2min
+			// internal timeout, swallowing the accepted connection in silence
+			// and outliving the handler's shutdown.
+			dialCtx, cancelDial := context.WithTimeout(ctx, 10*time.Second)
+			r, err := y.netstack.DialContext(dialCtx, "tcp", mapping.Mapped.String())
+			cancelDial()
 			if err != nil {
 				y.logger.Errorf("Failed to connect to %s: %s", mapping.Mapped, err)
+				stats.connClosed()
 				c.Close()
 				continue
 			}
 
+			// Hand the pre-dial gauge entry over to the wrapper, which owns
+			// the count for the rest of the connection's lifetime
+			stats.connClosed()
 			rc := wrapCountingConn(r, stats)
 			y.trackConnection(c)
 			y.trackConnection(rc)
@@ -1275,12 +1292,18 @@ func (y *Yggstack) handleRemoteTCPMappingCtx(ctx context.Context, key string, ma
 				}
 			}
 
-			r, err := net.DialTCP("tcp", nil, mapping.Mapped)
+			// Same treatment as the forward handler: count from accept, and
+			// bound the local dial instead of blocking on the OS default
+			stats.activeConns.Add(1)
+			dialer := net.Dialer{Timeout: 10 * time.Second}
+			r, err := dialer.DialContext(ctx, "tcp", mapping.Mapped.String())
 			if err != nil {
 				y.logger.Errorf("Failed to connect to local %s: %s", mapping.Mapped, err)
+				stats.connClosed()
 				c.Close()
 				continue
 			}
+			stats.connClosed()
 
 			cc := wrapCountingConn(c, stats)
 			y.trackConnection(cc)
