@@ -423,8 +423,7 @@ func main() {
 						continue
 					}
 
-					udpFwdConnPtr := udpSession.conn.(*gonet.UDPConn)
-					udpFwdConn := *udpFwdConnPtr
+					udpFwdConn := udpSession.conn.(*gonet.UDPConn)
 
 					_, err = udpFwdConn.Write(udpBuffer[:bytesRead])
 					if err != nil {

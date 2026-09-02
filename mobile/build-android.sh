@@ -12,7 +12,7 @@ cd "$ROOT_DIR"
 
 # Configuration
 PACKAGE_NAME="link.yggdrasil.yggstack"
-MIN_SDK=21
+MIN_SDK=23
 OUTPUT_DIR="android-build"
 AAR_NAME="yggstack"
 
@@ -30,8 +30,8 @@ echo -e "${GREEN}========================================${NC}"
 if ! command -v gomobile &> /dev/null; then
     echo -e "${RED}Error: gomobile is not installed${NC}"
     echo "Installing gomobile..."
-    go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260203041319-574ceaa2f723
-    go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260203041319-574ceaa2f723
+    go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
+    go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
 fi
 
 # Prepare the gomobile toolchain directory.
