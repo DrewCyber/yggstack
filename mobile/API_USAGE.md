@@ -6,7 +6,7 @@ This document describes how to use Yggstack mobile bindings in your Android appl
 
 ### Prerequisites
 
-1. Go toolchain (version pinned in the parent repo's `.github/workflows/build-release.yml`)
+1. Go toolchain >= 1.26.3 (as required by `go.mod`)
 2. gomobile + gobind (pinned versions)
 3. Android SDK and NDK
 
@@ -14,10 +14,10 @@ This document describes how to use Yggstack mobile bindings in your Android appl
 
 1. Install gomobile if needed — normally the build script does this automatically with the
 pinned versions. If installing manually, never use `@latest` and never run `gomobile init`;
-use the exact versions pinned in the parent repo's `.github/workflows/build-release.yml`:
+use the exact versions pinned in `build-android.sh`:
 ```bash
-go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260203041319-574ceaa2f723
-go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260203041319-574ceaa2f723
+go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
+go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
 ```
 
 2. Set Android SDK path:
@@ -389,10 +389,10 @@ class YggstackService : Service() {
 
 **Problem**: gomobile not found
 ```bash
-go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260203041319-574ceaa2f723
-go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260203041319-574ceaa2f723
+go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
+go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
 ```
-(Use the pinned versions from the parent repo's `.github/workflows/build-release.yml`, never `@latest`.)
+(Use the pinned versions from `build-android.sh`, never `@latest`.)
 
 **Problem**: Android SDK not found
 ```bash

@@ -41,7 +41,7 @@ Tagged releases provide packages similar to Yggdrasil.
 If you want to build from source, as opposed to installing one of the pre-built
 packages:
 
-1. Install [Go](https://golang.org) (requires Go 1.22 or later)
+1. Install [Go](https://golang.org) (requires Go 1.26.3 or later)
 2. Clone this repository
 2. Run `./build`
 
