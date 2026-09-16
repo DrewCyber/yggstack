@@ -6,7 +6,7 @@ This document describes how to use Yggstack mobile bindings in your Android appl
 
 ### Prerequisites
 
-1. Go toolchain >= 1.26.3 (as required by `go.mod`)
+1. Go toolchain >= 1.27.1 (as required by `go.mod`)
 2. gomobile + gobind (pinned versions)
 3. Android SDK and NDK
 

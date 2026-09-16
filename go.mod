@@ -1,6 +1,6 @@
 module github.com/yggdrasil-network/yggstack
 
-go 1.26.3
+go 1.27.1
 
 require (
 	github.com/gologme/log v1.3.0
@@ -9,7 +9,7 @@ require (
 	github.com/quic-go/quic-go v0.62.0
 	github.com/things-go/go-socks5 v0.1.3
 	github.com/yggdrasil-network/yggdrasil-go v0.5.14
-	gvisor.dev/gvisor v0.0.0-20250812171554-968e93457fe6
+	gvisor.dev/gvisor v0.0.0-20260916020802-1793a746b8cf
 )
 
 require (
@@ -21,6 +21,7 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc // indirect
 	golang.org/x/mobile v0.0.0-20260821190718-4776eadac327 // indirect
 	golang.org/x/mod v0.39.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
