@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 
 	"github.com/yggdrasil-network/yggdrasil-go/src/core"
 
@@ -18,7 +19,9 @@ import (
 )
 
 type YggdrasilNetstack struct {
-	stack *stack.Stack
+	stack     *stack.Stack
+	nic       *YggdrasilNIC
+	closeOnce sync.Once
 }
 
 func CreateYggdrasilNetstack(ygg *core.Core) (*YggdrasilNetstack, error) {
@@ -35,6 +38,7 @@ func CreateYggdrasilNetstack(ygg *core.Core) (*YggdrasilNetstack, error) {
 		panic(err)
 	}
 	if err := s.NewYggdrasilNIC(ygg); err != nil {
+		s.Close()
 		return nil, fmt.Errorf("s.NewYggdrasilNIC: %s", err.String())
 	}
 	return s, nil
@@ -104,4 +108,19 @@ func (s *YggdrasilNetstack) ListenTCP(addr *net.TCPAddr) (net.Listener, error) {
 func (s *YggdrasilNetstack) ListenUDP(addr *net.UDPAddr) (*gonet.UDPConn, error) {
 	fa, pn, _ := convertToFullAddr(addr.IP, addr.Port)
 	return gonet.DialUDP(s.stack, &fa, nil, pn)
+}
+
+// Close terminates the NIC and all gVisor endpoints and joins their workers.
+// It closes the core packet transport to interrupt the NIC's blocking Read.
+// The caller still owns core.Stop (and multicast/admin shutdown). No endpoints
+// may be created concurrently with Close; callers must join their users first.
+func (s *YggdrasilNetstack) Close() {
+	s.closeOnce.Do(func() {
+		if s.nic != nil {
+			s.nic.Close()
+			s.nic.Wait()
+		}
+		s.stack.Close()
+		s.stack.Wait()
+	})
 }

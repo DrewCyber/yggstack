@@ -17,7 +17,11 @@ import (
 )
 
 type YggdrasilNIC struct {
-	stack      *YggdrasilNetstack
+	interrupt  func() error
+	closeOnce  sync.Once
+	workers    sync.WaitGroup
+	stateMu    sync.RWMutex
+	closed     bool
 	ipv6rwc    *ipv6rwc.ReadWriteCloser
 	dispatcher stack.NetworkDispatcher
 	rstPackets chan *stack.PacketBuffer
@@ -37,13 +41,17 @@ func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 	}}
 	nic := &YggdrasilNIC{
 		ipv6rwc:    rwc,
+		interrupt:  ygg.Close,
 		writeBuf:   make([]byte, mtu),
 		rstPackets: make(chan *stack.PacketBuffer, 100),
 	}
+	s.nic = nic
 	if err := s.stack.CreateNIC(1, nic); err != nil {
 		return err
 	}
+	nic.workers.Add(2)
 	go func() {
+		defer nic.workers.Done()
 		for {
 			// Scratch buffer is pooled; the delivered payload is a private
 			// copy because gvisor endpoints may retain views beyond this
@@ -51,7 +59,7 @@ func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 			buf := rxPool.Get().([]byte)
 			rx, err := nic.ipv6rwc.Read(buf)
 			if err != nil {
-				log.Println(err)
+				rxPool.Put(buf)
 				break
 			}
 			payload := make([]byte, rx)
@@ -60,16 +68,19 @@ func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 			pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Payload: buffer.MakeWithData(payload),
 			})
-			nic.dispatcher.DeliverNetworkPacket(ipv6.ProtocolNumber, pkb)
+			nic.stateMu.RLock()
+			dispatcher := nic.dispatcher
+			closed := nic.closed
+			nic.stateMu.RUnlock()
+			if !closed && dispatcher != nil {
+				dispatcher.DeliverNetworkPacket(ipv6.ProtocolNumber, pkb)
+			}
 			pkb.DecRef()
 		}
 	}()
 	go func() {
-		for {
-			pkt := <-nic.rstPackets
-			if pkt == nil {
-				continue
-			}
+		defer nic.workers.Done()
+		for pkt := range nic.rstPackets {
 			_ = nic.writePacket(pkt)
 			pkt.DecRef()
 		}
@@ -105,9 +116,17 @@ func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 	return nil
 }
 
-func (e *YggdrasilNIC) Attach(dispatcher stack.NetworkDispatcher) { e.dispatcher = dispatcher }
+func (e *YggdrasilNIC) Attach(dispatcher stack.NetworkDispatcher) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.dispatcher = dispatcher
+}
 
-func (e *YggdrasilNIC) IsAttached() bool { return e.dispatcher != nil }
+func (e *YggdrasilNIC) IsAttached() bool {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	return e.dispatcher != nil
+}
 
 func (e *YggdrasilNIC) MTU() uint32 { return uint32(e.ipv6rwc.MTU()) }
 
@@ -121,7 +140,7 @@ func (*YggdrasilNIC) LinkAddress() tcpip.LinkAddress { return "" }
 
 func (*YggdrasilNIC) SetLinkAddress(tcpip.LinkAddress) {}
 
-func (*YggdrasilNIC) Wait() {}
+func (e *YggdrasilNIC) Wait() { e.workers.Wait() }
 
 func (e *YggdrasilNIC) writePacket(
 	pkt *stack.PacketBuffer,
@@ -138,7 +157,14 @@ func (e *YggdrasilNIC) writePacket(
 	// concurrently from several transport goroutines.
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+	e.stateMu.RLock()
+	closed := e.closed
+	e.stateMu.RUnlock()
+	if closed {
+		return &tcpip.ErrClosedForSend{}
+	}
 	vv := pkt.ToView()
+	defer vv.Release()
 	if vv.Size() > len(e.writeBuf) {
 		e.writeBuf = make([]byte, vv.Size())
 	}
@@ -162,6 +188,11 @@ func (e *YggdrasilNIC) WritePackets(
 			if pkt.Network().TransportProtocol() == tcp.ProtocolNumber {
 				tcpHeader := header.TCP(pkt.TransportHeader().Slice())
 				if (tcpHeader.Flags() & header.TCPFlagRst) == header.TCPFlagRst {
+					e.stateMu.RLock()
+					if e.closed {
+						e.stateMu.RUnlock()
+						return i, &tcpip.ErrClosedForSend{}
+					}
 					pkt.IncRef()
 					select {
 					case e.rstPackets <- pkt:
@@ -170,6 +201,7 @@ func (e *YggdrasilNIC) WritePackets(
 						// Channel full, drop packet and release ref
 						pkt.DecRef()
 					}
+					e.stateMu.RUnlock()
 					continue
 				}
 			}
@@ -200,8 +232,17 @@ func (e *YggdrasilNIC) ParseHeader(*stack.PacketBuffer) bool {
 }
 
 func (e *YggdrasilNIC) Close() {
-	e.stack.stack.RemoveNIC(1)
-	e.dispatcher = nil
+	e.closeOnce.Do(func() {
+		e.stateMu.Lock()
+		e.closed = true
+		close(e.rstPackets)
+		e.stateMu.Unlock()
+		// Closing the packet transport unblocks Read and any in-flight Write.
+		// Do not recursively remove the NIC here: gVisor calls Close itself.
+		if e.interrupt != nil {
+			_ = e.interrupt()
+		}
+	})
 }
 
 func (e *YggdrasilNIC) SetOnCloseAction(func()) {}

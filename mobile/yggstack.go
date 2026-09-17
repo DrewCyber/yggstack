@@ -18,7 +18,6 @@ import (
 
 	"github.com/gologme/log"
 	"github.com/hjson/hjson-go/v4"
-	"github.com/things-go/go-socks5"
 
 	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 	"github.com/yggdrasil-network/yggdrasil-go/src/admin"
@@ -32,18 +31,17 @@ import (
 
 // Yggstack is the main mobile binding object
 type Yggstack struct {
-	core         *core.Core
-	multicast    *multicast.Multicast
-	admin        *admin.AdminSocket
-	netstack     *netstack.YggdrasilNetstack
-	socks5Server *socks5.Server
-	socks5Tcp    net.Listener
-	logger       *log.Logger
-	logWriter    io.Writer
-	logLevel     string
-	config       *config.NodeConfig
-	ctx          context.Context
-	cancel       context.CancelFunc
+	core      *core.Core
+	multicast *multicast.Multicast
+	admin     *admin.AdminSocket
+	netstack  *netstack.YggdrasilNetstack
+	socks5Tcp net.Listener
+	logger    *log.Logger
+	logWriter io.Writer
+	logLevel  string
+	config    *config.NodeConfig
+	run       *workerScope
+	mappings  map[string]*workerScope
 
 	// Port mappings
 	localTCPMappings  []types.TCPMapping
@@ -51,26 +49,13 @@ type Yggstack struct {
 	remoteTCPMappings []types.TCPMapping
 	remoteUDPMappings []types.UDPMapping
 
-	// Active connections tracking for cleanup
-	activeConns   []net.Conn
-	activeConnsMu sync.Mutex
-
-	// Active listeners tracking for cleanup (TCP listeners and UDP conns)
-	activeListeners   []io.Closer
-	activeListenersMu sync.Mutex
-
-	// Per-mapping context cancellation and listener references for on-the-fly enable/disable
-	mappingCancels   sync.Map // string key → context.CancelFunc
-	mappingListeners sync.Map // string key → io.Closer
-
 	// Per-listener runtime stats (connection gauges, Yggdrasil-side RX/TX bytes),
-	// keyed like mappingCancels plus socksStatsKey for the SOCKS5 proxy
+	// keyed by mapping identity plus socksStatsKey for the SOCKS5 proxy
 	listenerStats sync.Map // string key → *listenerStats
 
 	// State
-	isRunning  bool
-	handlersWg sync.WaitGroup // Wait group for handler goroutines
-	mu         sync.RWMutex
+	isRunning bool
+	mu        sync.RWMutex
 }
 
 // LogWriter implements io.Writer for Android logging
@@ -384,7 +369,7 @@ func (y *Yggstack) RetryPeersNow() error {
 }
 
 // Start starts the Yggstack node with optional SOCKS listener and nameserver
-func (y *Yggstack) Start(socksAddress string, nameserver string) error {
+func (y *Yggstack) Start(socksAddress string, nameserver string) (startErr error) {
 	y.mu.Lock()
 	defer y.mu.Unlock()
 
@@ -396,10 +381,15 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 		return fmt.Errorf("config not loaded, call LoadConfigJSON first")
 	}
 
-	y.ctx, y.cancel = context.WithCancel(context.Background())
+	y.run = newWorkerScope(context.Background())
+	y.mappings = make(map[string]*workerScope)
+	defer func() {
+		if startErr != nil {
+			y.stopLocked()
+		}
+	}()
 
-	// Stats always describe the current run only, even if a previous stop
-	// was aborted before the registry was cleared
+	// Stats always describe the current run only.
 	y.resetListenerStats()
 
 	// Generate self-signed certificate if not already present
@@ -466,8 +456,12 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 	// Setup the multicast module
 	multicastOptions := []multicast.SetupOption{}
 	for _, intf := range y.config.MulticastInterfaces {
+		regex, err := regexp.Compile(intf.Regex)
+		if err != nil {
+			return fmt.Errorf("invalid multicast regex: %w", err)
+		}
 		multicastOptions = append(multicastOptions, multicast.MulticastInterface{
-			Regex:    regexp.MustCompile(intf.Regex),
+			Regex:    regex,
 			Beacon:   intf.Beacon,
 			Listen:   intf.Listen,
 			Port:     intf.Port,
@@ -485,84 +479,36 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 		return fmt.Errorf("failed to create netstack: %w", err)
 	}
 
-	// Start SOCKS server if requested
+	// Bind before starting any workers; failure uses the same rollback as Stop.
 	if socksAddress != "" {
-		socksStats := y.getOrCreateListenerStats(socksStatsKey, "socks", socksAddress, "")
-		netstackDial := y.netstack.DialContext
-		socksOptions := []socks5.Option{
-			socks5.WithDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := netstackDial(ctx, network, addr)
-				if err != nil {
-					return nil, err
-				}
-				// The control connection already owns the gauges; this leg
-				// only feeds payload bytes into the counters
-				return wrapTrafficOnlyConn(conn, socksStats), nil
-			}),
-		}
-
-		if nameserver != "" {
-			resolver := types.NewNameResolver(y.netstack, nameserver)
-			socksOptions = append(socksOptions, socks5.WithResolver(resolver))
-			y.logger.Infof("Using DNS nameserver: %s", nameserver)
-		} else {
-			y.logger.Infof("DNS nameserver is not set!")
-			y.logger.Infof("SOCKS server will not be able to resolve hostnames other than .pk.ygg!")
-		}
-
-		y.socks5Server = socks5.NewServer(socksOptions...)
-		y.logger.Infof("Starting SOCKS server on %s", socksAddress)
-
 		if y.socks5Tcp, err = net.Listen("tcp", socksAddress); err != nil {
-			y.Stop()
 			return fmt.Errorf("failed to start SOCKS listener: %w", err)
 		}
-
-		go func() {
-			var serveListener net.Listener = y.socks5Tcp
-			if listenerStatsWrappingEnabled {
-				serveListener = &countingListener{Listener: y.socks5Tcp, stats: socksStats}
-			}
-			if err := y.socks5Server.Serve(serveListener); err != nil {
-				y.logger.Errorf("SOCKS server error: %s", err)
-			}
-		}()
+		y.startSOCKS(y.socks5Tcp, nameserver)
 	}
 
 	// Setup local TCP mappings
 	for _, mapping := range y.localTCPMappings {
 		key := localTCPMappingKey(mapping.Listen.String(), mapping.Mapped.String())
-		childCtx, cancel := context.WithCancel(y.ctx)
-		y.mappingCancels.Store(key, cancel)
-		y.handlersWg.Add(1)
-		go y.handleLocalTCPMappingCtx(childCtx, key, mapping)
+		y.startMapping(key, func(scope *workerScope) { y.handleLocalTCPMappingCtx(scope, key, mapping) })
 	}
 
 	// Setup local UDP mappings
 	for _, mapping := range y.localUDPMappings {
 		key := localUDPMappingKey(mapping.Listen.String(), mapping.Mapped.String())
-		childCtx, cancel := context.WithCancel(y.ctx)
-		y.mappingCancels.Store(key, cancel)
-		y.handlersWg.Add(1)
-		go y.handleLocalUDPMappingCtx(childCtx, key, mapping)
+		y.startMapping(key, func(scope *workerScope) { y.handleLocalUDPMappingCtx(scope, key, mapping) })
 	}
 
 	// Setup remote TCP mappings
 	for _, mapping := range y.remoteTCPMappings {
 		key := remoteTCPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
-		childCtx, cancel := context.WithCancel(y.ctx)
-		y.mappingCancels.Store(key, cancel)
-		y.handlersWg.Add(1)
-		go y.handleRemoteTCPMappingCtx(childCtx, key, mapping)
+		y.startMapping(key, func(scope *workerScope) { y.handleRemoteTCPMappingCtx(scope, key, mapping) })
 	}
 
 	// Setup remote UDP mappings
 	for _, mapping := range y.remoteUDPMappings {
 		key := remoteUDPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
-		childCtx, cancel := context.WithCancel(y.ctx)
-		y.mappingCancels.Store(key, cancel)
-		y.handlersWg.Add(1)
-		go y.handleRemoteUDPMappingCtx(childCtx, key, mapping)
+		y.startMapping(key, func(scope *workerScope) { y.handleRemoteUDPMappingCtx(scope, key, mapping) })
 	}
 
 	y.isRunning = true
@@ -570,192 +516,53 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) error {
 	return nil
 }
 
-// Stop stops the Yggstack node
+// Stop stops the entire node, including during Android Power Save. Start and all
+// mutations remain serialized until teardown finishes; a new run never inherits
+// workers or resources from the previous one.
 func (y *Yggstack) Stop() error {
 	y.mu.Lock()
-
+	defer y.mu.Unlock()
 	if !y.isRunning {
-		y.mu.Unlock()
 		return fmt.Errorf("Yggstack is not running")
 	}
-
-	if y.cancel != nil {
-		y.cancel()
-	}
-
-	// Close SOCKS5 listener with deadline to prevent hanging
-	if y.socks5Tcp != nil {
-		// Set deadline before closing to unblock any Accept() calls
-		if tcpListener, ok := y.socks5Tcp.(*net.TCPListener); ok {
-			tcpListener.SetDeadline(time.Now())
-		}
-		y.socks5Tcp.Close()
-		y.socks5Tcp = nil
-		y.logger.Infof("SOCKS5 listener closed")
-	}
-
-	// Close all active listeners first to stop accepting new connections
-	y.closeAllListeners()
-
-	// Close all active proxy connections to unblock handlers
-	// Run with timeout to prevent hanging on stuck connections
-	closeConnsDone := make(chan struct{})
-	go func() {
-		y.closeAllConnections()
-		close(closeConnsDone)
-	}()
-
-	select {
-	case <-closeConnsDone:
-		y.logger.Infof("Connections closed successfully")
-	case <-time.After(2 * time.Second):
-		y.logger.Warnf("WARNING: Timeout closing connections after 2 seconds - forcing continuation")
-	}
-
-	// Release lock before waiting for handlers
-	y.mu.Unlock()
-
-	// Wait for all handler goroutines to finish with timeout
-	y.logger.Infof("Waiting for handlers to stop...")
-	done := make(chan struct{})
-	go func() {
-		y.handlersWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		y.logger.Infof("All handlers stopped")
-	case <-time.After(3 * time.Second):
-		y.logger.Warnf("Timeout waiting for handlers to stop, forcing shutdown")
-	}
-
-	// Reacquire lock for final cleanup
-	y.mu.Lock()
-	defer y.mu.Unlock()
-
-	if y.admin != nil {
-		y.admin.Stop()
-		y.admin = nil
-	}
-
-	if y.multicast != nil {
-		y.multicast.Stop()
-		y.multicast = nil
-	}
-
-	if y.netstack != nil {
-		// Netstack uses gvisor stack which doesn't need explicit cleanup
-		// It will be garbage collected once no references remain
-		y.netstack = nil
-	}
-
-	if y.core != nil {
-		// core.Stop() can block for several seconds closing broken peer connections.
-		// Run it in a goroutine with a hard timeout so a stuck core cannot prevent
-		// the Android service from restarting cleanly after a network switch.
-		coreStopped := make(chan struct{})
-		core := y.core
-		y.core = nil
-		go func() {
-			core.Stop()
-			close(coreStopped)
-		}()
-		select {
-		case <-coreStopped:
-			y.logger.Infof("core stopped")
-		case <-time.After(4 * time.Second):
-			y.logger.Warnf("core.Stop() timed out after 4s - forcing continuation")
-		}
-	}
-
-	y.socks5Server = nil
-
-	// Clear per-mapping tracking maps
-	y.mappingCancels.Range(func(k, v any) bool {
-		y.mappingCancels.Delete(k)
-		return true
-	})
-	y.mappingListeners.Range(func(k, v any) bool {
-		y.mappingListeners.Delete(k)
-		return true
-	})
-
-	// Listener stats only describe the current run; drop them on stop
-	y.resetListenerStats()
-
-	y.isRunning = false
-	y.logger.Infof("Yggstack stopped")
+	y.stopLocked()
 	return nil
 }
 
-// trackConnection adds a connection to the active connections list
-func (y *Yggstack) trackConnection(conn net.Conn) {
-	y.activeConnsMu.Lock()
-	defer y.activeConnsMu.Unlock()
-	y.activeConns = append(y.activeConns, conn)
-}
-
-func (y *Yggstack) trackListener(listener io.Closer) {
-	y.activeListenersMu.Lock()
-	defer y.activeListenersMu.Unlock()
-	y.activeListeners = append(y.activeListeners, listener)
-}
-
-// closeAllListeners forcefully closes all tracked listeners
-func (y *Yggstack) closeAllListeners() {
-	y.activeListenersMu.Lock()
-	listeners := y.activeListeners
-	y.activeListeners = nil
-	y.activeListenersMu.Unlock()
-
-	// Set deadlines on listeners that support it before closing
-	deadline := time.Now()
-	for _, listener := range listeners {
-		// Try to set deadline if the listener type supports it
-		if tcpListener, ok := listener.(*net.TCPListener); ok {
-			tcpListener.SetDeadline(deadline)
-		} else if udpConn, ok := listener.(*net.UDPConn); ok {
-			udpConn.SetDeadline(deadline)
-		}
+// stopLocked also rolls back partial startup, independently of isRunning.
+// Workers must not acquire y.mu: teardown holds it until every worker is joined.
+func (y *Yggstack) stopLocked() {
+	y.isRunning = false
+	if y.run != nil {
+		y.run.Close()
 	}
-
-	// Now close all listeners
-	for _, listener := range listeners {
-		listener.Close()
+	// Cancel every mapping before joining any one of them.
+	for _, scope := range y.mappings {
+		scope.Close()
 	}
-	y.logger.Infof("Closed %d active listeners", len(listeners))
-}
-
-// closeAllConnections forcefully closes all tracked connections
-func (y *Yggstack) closeAllConnections() {
-	y.activeConnsMu.Lock()
-	conns := y.activeConns
-	y.activeConns = nil
-	y.activeConnsMu.Unlock()
-
-	// Set aggressive deadlines on all connections BEFORE closing
-	// This forces any blocked Read()/Write() operations to timeout immediately
-	deadline := time.Now().Add(100 * time.Millisecond)
-	for _, conn := range conns {
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetDeadline(deadline)
-		} else if udpConn, ok := conn.(*net.UDPConn); ok {
-			udpConn.SetDeadline(deadline)
-		} else {
-			// For other connection types, try setting deadline via generic interface
-			conn.SetDeadline(deadline)
-		}
+	for key := range y.mappings {
+		y.stopMapping(key)
 	}
-
-	// Small delay to allow deadlines to trigger
-	time.Sleep(150 * time.Millisecond)
-
-	// Now close all connections - they should close quickly
-	for _, conn := range conns {
-		conn.Close()
+	if y.run != nil {
+		y.run.stop()
 	}
-	y.logger.Infof("Closed %d active connections", len(conns))
+	if y.admin != nil {
+		y.admin.Stop()
+	}
+	if y.multicast != nil {
+		y.multicast.Stop()
+	}
+	if y.netstack != nil {
+		y.netstack.Close()
+	}
+	if y.core != nil {
+		y.core.Stop()
+	}
+	y.admin, y.multicast, y.core, y.netstack = nil, nil, nil, nil
+	y.socks5Tcp = nil
+	y.run, y.mappings = nil, nil
+	y.resetListenerStats()
+	y.logger.Infof("Yggstack stopped")
 }
 
 // IsRunning returns whether Yggstack is currently running
@@ -791,10 +598,7 @@ func (y *Yggstack) AddLocalTCPMapping(localAddr, remoteAddr string) error {
 	// If already running, start the mapping handler
 	if y.isRunning {
 		key := localTCPMappingKey(localTCPAddr.String(), remoteTCPAddr.String())
-		childCtx, cancel := context.WithCancel(y.ctx)
-		y.mappingCancels.Store(key, cancel)
-		y.handlersWg.Add(1)
-		go y.handleLocalTCPMappingCtx(childCtx, key, mapping)
+		y.startMapping(key, func(scope *workerScope) { y.handleLocalTCPMappingCtx(scope, key, mapping) })
 	}
 
 	y.logger.Infof("Added local TCP mapping: %s -> %s", localAddr, remoteAddr)
@@ -827,10 +631,7 @@ func (y *Yggstack) AddLocalUDPMapping(localAddr, remoteAddr string) error {
 	// If already running, start the mapping handler
 	if y.isRunning {
 		key := localUDPMappingKey(localUDPAddr.String(), remoteUDPAddr.String())
-		childCtx, cancel := context.WithCancel(y.ctx)
-		y.mappingCancels.Store(key, cancel)
-		y.handlersWg.Add(1)
-		go y.handleLocalUDPMappingCtx(childCtx, key, mapping)
+		y.startMapping(key, func(scope *workerScope) { y.handleLocalUDPMappingCtx(scope, key, mapping) })
 	}
 
 	y.logger.Infof("Added local UDP mapping: %s -> %s", localAddr, remoteAddr)
@@ -873,10 +674,7 @@ func (y *Yggstack) AddRemoteTCPMapping(remotePort int, localAddr string) error {
 	// If already running, start the mapping handler
 	if y.isRunning {
 		key := remoteTCPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
-		childCtx, cancel := context.WithCancel(y.ctx)
-		y.mappingCancels.Store(key, cancel)
-		y.handlersWg.Add(1)
-		go y.handleRemoteTCPMappingCtx(childCtx, key, mapping)
+		y.startMapping(key, func(scope *workerScope) { y.handleRemoteTCPMappingCtx(scope, key, mapping) })
 	}
 
 	y.logger.Infof("Added remote TCP mapping: [%s]:%d -> %s", ip, remotePort, localAddr)
@@ -919,10 +717,7 @@ func (y *Yggstack) AddRemoteUDPMapping(remotePort int, localAddr string) error {
 	// If already running, start the mapping handler
 	if y.isRunning {
 		key := remoteUDPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
-		childCtx, cancel := context.WithCancel(y.ctx)
-		y.mappingCancels.Store(key, cancel)
-		y.handlersWg.Add(1)
-		go y.handleRemoteUDPMappingCtx(childCtx, key, mapping)
+		y.startMapping(key, func(scope *workerScope) { y.handleRemoteUDPMappingCtx(scope, key, mapping) })
 	}
 
 	y.logger.Infof("Added remote UDP mapping: [%s]:%d -> %s", ip, remotePort, localAddr)
@@ -933,6 +728,11 @@ func (y *Yggstack) AddRemoteUDPMapping(remotePort int, localAddr string) error {
 func (y *Yggstack) ClearLocalMappings() error {
 	y.mu.Lock()
 	defer y.mu.Unlock()
+	for key := range y.mappings {
+		if strings.HasPrefix(key, "ltcp:") || strings.HasPrefix(key, "ludp:") {
+			y.stopMapping(key)
+		}
+	}
 
 	y.localTCPMappings = nil
 	y.localUDPMappings = nil
@@ -945,6 +745,11 @@ func (y *Yggstack) ClearLocalMappings() error {
 func (y *Yggstack) ClearRemoteMappings() error {
 	y.mu.Lock()
 	defer y.mu.Unlock()
+	for key := range y.mappings {
+		if strings.HasPrefix(key, "rtcp:") || strings.HasPrefix(key, "rudp:") {
+			y.stopMapping(key)
+		}
+	}
 
 	y.remoteTCPMappings = nil
 	y.remoteUDPMappings = nil
@@ -969,13 +774,7 @@ func (y *Yggstack) RemoveLocalTCPMapping(localAddr, remoteAddr string) error {
 	}
 
 	key := localTCPMappingKey(localTCPAddr.String(), remoteTCPAddr.String())
-	if v, ok := y.mappingCancels.LoadAndDelete(key); ok {
-		v.(context.CancelFunc)()
-	}
-	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
-		v.(io.Closer).Close()
-	}
-	y.removeListenerStats(key)
+	y.stopMapping(key)
 
 	newMappings := make([]types.TCPMapping, 0, len(y.localTCPMappings))
 	for _, m := range y.localTCPMappings {
@@ -1004,13 +803,7 @@ func (y *Yggstack) RemoveLocalUDPMapping(localAddr, remoteAddr string) error {
 	}
 
 	key := localUDPMappingKey(localUDPAddr.String(), remoteUDPAddr.String())
-	if v, ok := y.mappingCancels.LoadAndDelete(key); ok {
-		v.(context.CancelFunc)()
-	}
-	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
-		v.(io.Closer).Close()
-	}
-	y.removeListenerStats(key)
+	y.stopMapping(key)
 
 	newMappings := make([]types.UDPMapping, 0, len(y.localUDPMappings))
 	for _, m := range y.localUDPMappings {
@@ -1035,13 +828,7 @@ func (y *Yggstack) RemoveRemoteTCPMapping(remotePort int, localAddr string) erro
 	}
 
 	key := remoteTCPMappingKey(remotePort, localTCPAddr.String())
-	if v, ok := y.mappingCancels.LoadAndDelete(key); ok {
-		v.(context.CancelFunc)()
-	}
-	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
-		v.(io.Closer).Close()
-	}
-	y.removeListenerStats(key)
+	y.stopMapping(key)
 
 	newMappings := make([]types.TCPMapping, 0, len(y.remoteTCPMappings))
 	for _, m := range y.remoteTCPMappings {
@@ -1066,13 +853,7 @@ func (y *Yggstack) RemoveRemoteUDPMapping(remotePort int, localAddr string) erro
 	}
 
 	key := remoteUDPMappingKey(remotePort, localUDPAddr.String())
-	if v, ok := y.mappingCancels.LoadAndDelete(key); ok {
-		v.(context.CancelFunc)()
-	}
-	if v, ok := y.mappingListeners.LoadAndDelete(key); ok {
-		v.(io.Closer).Close()
-	}
-	y.removeListenerStats(key)
+	y.stopMapping(key)
 
 	newMappings := make([]types.UDPMapping, 0, len(y.remoteUDPMappings))
 	for _, m := range y.remoteUDPMappings {
@@ -1087,10 +868,8 @@ func (y *Yggstack) RemoveRemoteUDPMapping(remotePort int, localAddr string) erro
 }
 
 // Helper functions for port mapping handlers
-func (y *Yggstack) handleLocalTCPMappingCtx(ctx context.Context, key string, mapping types.TCPMapping) {
-	defer y.handlersWg.Done()
-	defer y.mappingListeners.Delete(key)
-	defer y.mappingCancels.Delete(key)
+func (y *Yggstack) handleLocalTCPMappingCtx(scope *workerScope, key string, mapping types.TCPMapping) {
+	ctx := scope.ctx
 
 	select {
 	case <-ctx.Done():
@@ -1105,8 +884,9 @@ func (y *Yggstack) handleLocalTCPMappingCtx(ctx context.Context, key string, map
 	}
 	defer listener.Close()
 
-	y.trackListener(listener)
-	y.mappingListeners.Store(key, listener)
+	if !scope.own(listener) {
+		return
+	}
 
 	stats := y.getOrCreateListenerStats(key, "local-tcp", mapping.Listen.String(), mapping.Mapped.String())
 
@@ -1129,9 +909,11 @@ func (y *Yggstack) handleLocalTCPMappingCtx(ctx context.Context, key string, map
 				case <-ctx.Done():
 					return
 				default:
-					continue
+					return
 				}
 			}
+
+			c = scope.conn(c)
 
 			// Count the connection from the moment it is accepted, not after
 			// the dial completes: the client is already parked on this socket,
@@ -1158,18 +940,14 @@ func (y *Yggstack) handleLocalTCPMappingCtx(ctx context.Context, key string, map
 			// the count for the rest of the connection's lifetime
 			stats.connClosed()
 			rc := wrapCountingConn(r, stats)
-			y.trackConnection(c)
-			y.trackConnection(rc)
-
-			go types.ProxyTCP(y.core.MTU(), c, rc)
+			rc = scope.conn(rc)
+			scope.goWorker(func() { types.ProxyTCP(y.core.MTU(), c, rc) })
 		}
 	}
 }
 
-func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, mapping types.UDPMapping) {
-	defer y.handlersWg.Done()
-	defer y.mappingListeners.Delete(key)
-	defer y.mappingCancels.Delete(key)
+func (y *Yggstack) handleLocalUDPMappingCtx(scope *workerScope, key string, mapping types.UDPMapping) {
+	ctx := scope.ctx
 
 	select {
 	case <-ctx.Done():
@@ -1185,8 +963,9 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 	}
 	defer udpListenConn.Close()
 
-	y.trackListener(udpListenConn)
-	y.mappingListeners.Store(key, udpListenConn)
+	if !scope.own(udpListenConn) {
+		return
+	}
 
 	stats := y.getOrCreateListenerStats(key, "local-udp", mapping.Listen.String(), mapping.Mapped.String())
 	defer stats.sessionsEnded()
@@ -1218,7 +997,7 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 				case <-ctx.Done():
 					return
 				default:
-					continue
+					return
 				}
 			}
 
@@ -1236,13 +1015,15 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 				}
 				// Each remote client endpoint is one counted connection; the
 				// wrapper feeds both the reverse pump and the inline writes
-				wrapped := wrapCountingConn(raw, stats)
+				wrapped := scope.conn(wrapCountingConn(raw, stats))
 				sess = newUDPSession(wrapped)
 				localUdpConnections.Store(connKey, sess)
 
-				y.trackConnection(wrapped)
-
-				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, wrapped)
+				scope.goWorker(func() {
+					defer wrapped.Close()
+					defer localUdpConnections.CompareAndDelete(connKey, sess)
+					types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, wrapped)
+				})
 			}
 
 			if _, err := sess.conn.Write(udpBuffer[:bytesRead]); err != nil {
@@ -1252,10 +1033,8 @@ func (y *Yggstack) handleLocalUDPMappingCtx(ctx context.Context, key string, map
 	}
 }
 
-func (y *Yggstack) handleRemoteTCPMappingCtx(ctx context.Context, key string, mapping types.TCPMapping) {
-	defer y.handlersWg.Done()
-	defer y.mappingListeners.Delete(key)
-	defer y.mappingCancels.Delete(key)
+func (y *Yggstack) handleRemoteTCPMappingCtx(scope *workerScope, key string, mapping types.TCPMapping) {
+	ctx := scope.ctx
 
 	select {
 	case <-ctx.Done():
@@ -1270,8 +1049,9 @@ func (y *Yggstack) handleRemoteTCPMappingCtx(ctx context.Context, key string, ma
 	}
 	defer listener.Close()
 
-	y.trackListener(listener)
-	y.mappingListeners.Store(key, listener)
+	if !scope.own(listener) {
+		return
+	}
 
 	stats := y.getOrCreateListenerStats(key, "remote-tcp", mapping.Listen.String(), mapping.Mapped.String())
 
@@ -1288,9 +1068,11 @@ func (y *Yggstack) handleRemoteTCPMappingCtx(ctx context.Context, key string, ma
 				case <-ctx.Done():
 					return
 				default:
-					continue
+					return
 				}
 			}
+
+			c = scope.conn(c)
 
 			// Same treatment as the forward handler: count from accept, and
 			// bound the local dial instead of blocking on the OS default
@@ -1306,18 +1088,15 @@ func (y *Yggstack) handleRemoteTCPMappingCtx(ctx context.Context, key string, ma
 			stats.connClosed()
 
 			cc := wrapCountingConn(c, stats)
-			y.trackConnection(cc)
-			y.trackConnection(r)
-
-			go types.ProxyTCP(y.core.MTU(), cc, r)
+			cc = scope.conn(cc)
+			r = scope.conn(r)
+			scope.goWorker(func() { types.ProxyTCP(y.core.MTU(), cc, r) })
 		}
 	}
 }
 
-func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, mapping types.UDPMapping) {
-	defer y.handlersWg.Done()
-	defer y.mappingListeners.Delete(key)
-	defer y.mappingCancels.Delete(key)
+func (y *Yggstack) handleRemoteUDPMappingCtx(scope *workerScope, key string, mapping types.UDPMapping) {
+	ctx := scope.ctx
 
 	select {
 	case <-ctx.Done():
@@ -1339,8 +1118,9 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, ma
 	udpListenConn := wrapCountingPacketConn(rawListenConn, stats)
 	defer udpListenConn.Close()
 
-	y.trackListener(udpListenConn)
-	y.mappingListeners.Store(key, udpListenConn)
+	if !scope.own(udpListenConn) {
+		return
+	}
 
 	y.logger.Infof("Exposing local UDP %s on Yggdrasil port %d", mapping.Mapped, mapping.Listen.Port)
 
@@ -1368,7 +1148,7 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, ma
 				case <-ctx.Done():
 					return
 				default:
-					continue
+					return
 				}
 			}
 
@@ -1386,13 +1166,15 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(ctx context.Context, key string, ma
 				}
 				// Each remote client endpoint is one counted connection; the
 				// wrapper feeds both the reverse pump and the inline writes
-				wrapped := wrapCountingConn(localConn, stats)
+				wrapped := scope.conn(wrapCountingConn(localConn, stats))
 				sess = newUDPSession(wrapped)
 				localUdpConnections.Store(connKey, sess)
 
-				y.trackConnection(wrapped)
-
-				go types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, wrapped)
+				scope.goWorker(func() {
+					defer wrapped.Close()
+					defer localUdpConnections.CompareAndDelete(connKey, sess)
+					types.ReverseProxyUDP(mtu, udpListenConn, remoteUdpAddr, wrapped)
+				})
 			}
 
 			if _, err := sess.conn.Write(udpBuffer[:bytesRead]); err != nil {

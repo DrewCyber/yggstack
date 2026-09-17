@@ -26,16 +26,11 @@ func ProxyTCP(mtu uint64, c1, c2 net.Conn) error {
 	go func() { errCh <- tcpProxyFunc(mtu, c1, c2) }()
 	go func() { errCh <- tcpProxyFunc(mtu, c2, c1) }()
 
-	// Wait
-	for i := 0; i < 2; i++ {
-		e := <-errCh
-		if e != nil {
-			// Close connections and return
-			c1.Close()
-			c2.Close()
-			return e
-		}
-	}
-
-	return nil
+	// Close both legs after the first pump exits, then join the other pump.
+	// Returning early here would let a worker outlive its mapping/run owner.
+	err := <-errCh
+	c1.Close()
+	c2.Close()
+	<-errCh
+	return err
 }
