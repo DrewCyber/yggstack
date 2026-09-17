@@ -19,8 +19,7 @@ var listenerStatsWrappingEnabled = true
 // before its session is expired and the active gauge decremented.
 const udpSessionIdleTimeout = 60 * time.Second
 
-// udpSweepInterval throttles how often a mapping handler scans its session
-// map for idle entries; it piggybacks on the handler's read-timeout loop.
+// udpSweepInterval controls the independent session reaper cadence.
 const udpSweepInterval = 5 * time.Second
 
 // wrapCountingConn counts bytes AND registers the connection in the
@@ -33,8 +32,33 @@ func wrapCountingConn(conn net.Conn, stats *listenerStats) net.Conn {
 	return &countingConn{Conn: conn, stats: stats, trackGauges: true}
 }
 
-// wrapTrafficOnlyConn counts only bytes; used for secondary legs (e.g. the
-// destination conn behind an already-counted SOCKS control connection).
+// wrapGaugeOnlyConn tracks a local control/session socket without counting
+// local-side bytes or SOCKS protocol overhead as Yggdrasil traffic.
+func wrapGaugeOnlyConn(conn net.Conn, stats *listenerStats) net.Conn {
+	if !listenerStatsWrappingEnabled {
+		return conn
+	}
+	stats.connOpened()
+	return &gaugeConn{Conn: conn, stats: stats}
+}
+
+type gaugeConn struct {
+	net.Conn
+	stats *listenerStats
+	once  sync.Once
+	err   error
+}
+
+func (c *gaugeConn) Close() error {
+	c.once.Do(func() {
+		c.err = c.Conn.Close()
+		c.stats.connClosed()
+	})
+	return c.err
+}
+
+// wrapTrafficOnlyConn counts Yggdrasil bytes when a local control socket
+// already owns the connection gauge.
 func wrapTrafficOnlyConn(conn net.Conn, stats *listenerStats) net.Conn {
 	if !listenerStatsWrappingEnabled {
 		return conn
@@ -258,44 +282,62 @@ func (l *countingListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newCountingConn(conn, l.stats), nil
+	return wrapGaugeOnlyConn(conn, l.stats), nil
 }
 
-// udpSession tracks one client endpoint sharing a UDP mapping's socket, so
-// idle endpoints can be expired instead of accumulating for the mapping's
-// entire lifetime. conn is expected to already be wrapped with
-// wrapCountingConn, so closing it decrements the listener's active gauge.
+// udpSession tracks client-originated activity. Replies do not keep an
+// otherwise idle client alive indefinitely.
 type udpSession struct {
-	conn       net.Conn
-	lastSeenNs atomic.Int64
+	conn     net.Conn
+	mu       sync.Mutex
+	lastSeen time.Time
+	expired  bool
 }
 
 func newUDPSession(conn net.Conn) *udpSession {
-	s := &udpSession{conn: conn}
-	s.touch()
-	return s
+	return &udpSession{conn: conn, lastSeen: time.Now()}
 }
 
-func (s *udpSession) touch() {
-	s.lastSeenNs.Store(time.Now().UnixNano())
+func (s *udpSession) touch() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.expired {
+		return false
+	}
+	s.lastSeen = time.Now()
+	return true
 }
 
-func (s *udpSession) idleFor(now time.Time) time.Duration {
-	return now.Sub(time.Unix(0, s.lastSeenNs.Load()))
-}
-
-// sweepIdleUDPSessions closes and forgets sessions that have been idle for
-// longer than udpSessionIdleTimeout. It is only safe to call from the same
-// goroutine that reads incoming packets for this session map, since that is
-// the only other place entries are inserted or touched.
 func sweepIdleUDPSessions(sessions *sync.Map, now time.Time) {
 	sessions.Range(func(key, value any) bool {
 		sess := value.(*udpSession)
-		if sess.idleFor(now) < udpSessionIdleTimeout {
-			return true
+		sess.mu.Lock()
+		expire := !sess.expired && now.Sub(sess.lastSeen) >= udpSessionIdleTimeout
+		if expire {
+			sess.expired = true
 		}
-		sessions.Delete(key)
-		sess.conn.Close()
+		sess.mu.Unlock()
+		if expire {
+			sessions.CompareAndDelete(key, sess)
+			sess.conn.Close()
+		}
 		return true
+	})
+}
+
+// The reaper is owned and joined by the same scope as the relay workers.
+// It runs even when reads never time out or the packet handler is blocked.
+func startUDPSessionReaper(scope *workerScope, sessions *sync.Map, interval time.Duration) {
+	scope.goWorker(func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-scope.ctx.Done():
+				return
+			case now := <-ticker.C:
+				sweepIdleUDPSessions(sessions, now)
+			}
+		}
 	})
 }

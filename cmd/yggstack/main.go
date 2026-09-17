@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -120,18 +118,22 @@ func main() {
 
 	case *useconf:
 		if _, err := cfg.ReadFrom(os.Stdin); err != nil {
-			panic(err)
+			fmt.Fprintln(os.Stderr, "Failed to read configuration:", err)
+			os.Exit(1)
 		}
 
 	case *useconffile != "":
 		f, err := os.Open(*useconffile)
 		if err != nil {
-			panic(err)
+			fmt.Fprintln(os.Stderr, "Failed to open configuration:", err)
+			os.Exit(1)
 		}
-		if _, err := cfg.ReadFrom(f); err != nil {
-			panic(err)
-		}
+		_, err = cfg.ReadFrom(f)
 		_ = f.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Failed to read configuration:", err)
+			os.Exit(1)
+		}
 
 	case *genconf:
 		// Force AdminListen to none in yggstack
@@ -158,8 +160,11 @@ func main() {
 		return
 	}
 
-	privateKey := ed25519.PrivateKey(cfg.PrivateKey)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
+	publicKey, err := types.ConfigPublicKey(cfg)
+	if err != nil {
+		logger.Errorln(err)
+		return
+	}
 
 	switch {
 	case *getaddr:
@@ -207,6 +212,11 @@ func main() {
 		return
 	}
 
+	multicastOptions, err := types.ValidateConfig(cfg)
+	if err != nil {
+		logger.Errorln(err)
+		return
+	}
 	n := &node{}
 
 	// Setup the Yggdrasil node itself.
@@ -262,18 +272,8 @@ func main() {
 
 	// Setup the multicast module.
 	{
-		options := []multicast.SetupOption{}
-		for _, intf := range cfg.MulticastInterfaces {
-			options = append(options, multicast.MulticastInterface{
-				Regex:    regexp.MustCompile(intf.Regex),
-				Beacon:   intf.Beacon,
-				Listen:   intf.Listen,
-				Port:     intf.Port,
-				Priority: uint8(intf.Priority),
-				Password: intf.Password,
-			})
-		}
-		if n.multicast, err = multicast.New(n.core, logger, options...); err != nil {
+
+		if n.multicast, err = multicast.New(n.core, logger, multicastOptions...); err != nil {
 			panic(err)
 		}
 		if n.admin != nil && n.multicast != nil {

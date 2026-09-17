@@ -3,7 +3,6 @@ package mobile
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -185,6 +183,9 @@ func (y *Yggstack) LoadConfigJSON(configJSON string) error {
 		}
 	}
 
+	if _, err := types.ValidateConfig(cfg); err != nil {
+		return err
+	}
 	cfg.AdminListen = "none"
 	y.config = cfg
 	return nil
@@ -199,8 +200,10 @@ func (y *Yggstack) GetAddress() (string, error) {
 		return "", fmt.Errorf("config not loaded")
 	}
 
-	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
+	publicKey, err := types.ConfigPublicKey(y.config)
+	if err != nil {
+		return "", err
+	}
 	addr := address.AddrForKey(publicKey)
 	ip := net.IP(addr[:])
 	return ip.String(), nil
@@ -215,8 +218,10 @@ func (y *Yggstack) GetSubnet() (string, error) {
 		return "", fmt.Errorf("config not loaded")
 	}
 
-	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
+	publicKey, err := types.ConfigPublicKey(y.config)
+	if err != nil {
+		return "", err
+	}
 	snet := address.SubnetForKey(publicKey)
 	ipnet := net.IPNet{
 		IP:   append(snet[:], 0, 0, 0, 0, 0, 0, 0, 0),
@@ -234,8 +239,10 @@ func (y *Yggstack) GetPublicKey() (string, error) {
 		return "", fmt.Errorf("config not loaded")
 	}
 
-	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
+	publicKey, err := types.ConfigPublicKey(y.config)
+	if err != nil {
+		return "", err
+	}
 	return hex.EncodeToString(publicKey), nil
 }
 
@@ -381,6 +388,11 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) (startErr error
 		return fmt.Errorf("config not loaded, call LoadConfigJSON first")
 	}
 
+	multicastOptions, err := types.ValidateConfig(y.config)
+	if err != nil {
+		return err
+	}
+
 	y.run = newWorkerScope(context.Background())
 	y.mappings = make(map[string]*workerScope)
 	defer func() {
@@ -400,8 +412,7 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) (startErr error
 	}
 
 	// Setup the Yggdrasil core
-	var err error
-	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
+	publicKey, _ := types.ConfigPublicKey(y.config)
 	options := []core.SetupOption{
 		core.NodeInfo(y.config.NodeInfo),
 		core.NodeInfoPrivacy(y.config.NodeInfoPrivacy),
@@ -438,7 +449,6 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) (startErr error
 	}
 
 	address, subnet := y.core.Address(), y.core.Subnet()
-	publicKey := privateKey.Public().(ed25519.PublicKey)
 	publicstr := hex.EncodeToString(publicKey)
 	y.logger.Infof("Your public key is %s", publicstr)
 	y.logger.Infof("Your IPv6 address is %s", address.String())
@@ -454,21 +464,6 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) (startErr error
 	}
 
 	// Setup the multicast module
-	multicastOptions := []multicast.SetupOption{}
-	for _, intf := range y.config.MulticastInterfaces {
-		regex, err := regexp.Compile(intf.Regex)
-		if err != nil {
-			return fmt.Errorf("invalid multicast regex: %w", err)
-		}
-		multicastOptions = append(multicastOptions, multicast.MulticastInterface{
-			Regex:    regex,
-			Beacon:   intf.Beacon,
-			Listen:   intf.Listen,
-			Port:     intf.Port,
-			Priority: uint8(intf.Priority),
-			Password: intf.Password,
-		})
-	}
 
 	if y.multicast, err = multicast.New(y.core, y.buildLogger(), multicastOptions...); err != nil {
 		return fmt.Errorf("failed to create multicast: %w", err)
@@ -654,8 +649,10 @@ func (y *Yggstack) AddRemoteTCPMapping(remotePort int, localAddr string) error {
 	}
 
 	// Get our Yggdrasil address
-	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
+	publicKey, err := types.ConfigPublicKey(y.config)
+	if err != nil {
+		return err
+	}
 	addr := address.AddrForKey(publicKey)
 	ip := net.IP(addr[:])
 
@@ -697,8 +694,10 @@ func (y *Yggstack) AddRemoteUDPMapping(remotePort int, localAddr string) error {
 	}
 
 	// Get our Yggdrasil address
-	privateKey := ed25519.PrivateKey(y.config.PrivateKey)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
+	publicKey, err := types.ConfigPublicKey(y.config)
+	if err != nil {
+		return err
+	}
 	addr := address.AddrForKey(publicKey)
 	ip := net.IP(addr[:])
 
@@ -974,7 +973,7 @@ func (y *Yggstack) handleLocalUDPMappingCtx(scope *workerScope, key string, mapp
 
 	localUdpConnections := new(sync.Map)
 	udpBuffer := make([]byte, mtu)
-	nextSweep := time.Now().Add(udpSweepInterval)
+	startUDPSessionReaper(scope, localUdpConnections, udpSweepInterval)
 
 	for {
 		udpListenConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
@@ -987,10 +986,6 @@ func (y *Yggstack) handleLocalUDPMappingCtx(scope *workerScope, key string, mapp
 			bytesRead, remoteUdpAddr, err := udpListenConn.ReadFrom(udpBuffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					if now := time.Now(); now.After(nextSweep) {
-						sweepIdleUDPSessions(localUdpConnections, now)
-						nextSweep = now.Add(udpSweepInterval)
-					}
 					continue
 				}
 				select {
@@ -1006,8 +1001,11 @@ func (y *Yggstack) handleLocalUDPMappingCtx(scope *workerScope, key string, mapp
 
 			if v, ok := localUdpConnections.Load(connKey); ok {
 				sess = v.(*udpSession)
-				sess.touch()
-			} else {
+				if !sess.touch() {
+					sess = nil
+				}
+			}
+			if sess == nil {
 				raw, dialErr := y.netstack.DialUDP(mapping.Mapped)
 				if dialErr != nil {
 					y.logger.Errorf("Failed to dial UDP %s: %s", mapping.Mapped, dialErr)
@@ -1126,7 +1124,7 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(scope *workerScope, key string, map
 
 	localUdpConnections := new(sync.Map)
 	udpBuffer := make([]byte, mtu)
-	nextSweep := time.Now().Add(udpSweepInterval)
+	startUDPSessionReaper(scope, localUdpConnections, udpSweepInterval)
 
 	for {
 		udpListenConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
@@ -1138,10 +1136,6 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(scope *workerScope, key string, map
 			bytesRead, remoteUdpAddr, err := udpListenConn.ReadFrom(udpBuffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					if now := time.Now(); now.After(nextSweep) {
-						sweepIdleUDPSessions(localUdpConnections, now)
-						nextSweep = now.Add(udpSweepInterval)
-					}
 					continue
 				}
 				select {
@@ -1157,16 +1151,18 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(scope *workerScope, key string, map
 
 			if v, ok := localUdpConnections.Load(connKey); ok {
 				sess = v.(*udpSession)
-				sess.touch()
-			} else {
+				if !sess.touch() {
+					sess = nil
+				}
+			}
+			if sess == nil {
 				localConn, dialErr := net.DialUDP("udp", nil, mapping.Mapped)
 				if dialErr != nil {
 					y.logger.Errorf("Failed to dial local UDP %s: %s", mapping.Mapped, dialErr)
 					continue
 				}
-				// Each remote client endpoint is one counted connection; the
-				// wrapper feeds both the reverse pump and the inline writes
-				wrapped := scope.conn(wrapCountingConn(localConn, stats))
+				// Count sessions here, but bytes only on the shared Yggdrasil socket.
+				wrapped := scope.conn(wrapGaugeOnlyConn(localConn, stats))
 				sess = newUDPSession(wrapped)
 				localUdpConnections.Store(connKey, sess)
 

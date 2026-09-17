@@ -227,6 +227,31 @@ func TestMappingRemoveReadd(t *testing.T) {
 	stopNode(t, y)
 }
 
+func TestClosedConnectionsUnregisterBeforeStop(t *testing.T) {
+	scope := newWorkerScope(context.Background())
+	defer scope.stop()
+	stats := new(listenerStats)
+	for range 100 {
+		a, b := net.Pipe()
+		c := scope.conn(wrapGaugeOnlyConn(a, stats))
+		var wg sync.WaitGroup
+		for range 3 {
+			wg.Go(func() { c.Close() })
+		}
+		wg.Wait()
+		b.Close()
+		scope.mu.Lock()
+		count := len(scope.resources)
+		scope.mu.Unlock()
+		if count != 0 {
+			t.Fatalf("closed connection retained: %d", count)
+		}
+	}
+	if stats.activeConns.Load() != 0 || stats.totalConns.Load() != 100 {
+		t.Fatal("close was not counted exactly once")
+	}
+}
+
 func TestScopeLateRegistrationAndJoin(t *testing.T) {
 	s := newWorkerScope(context.Background())
 	a, b := net.Pipe()

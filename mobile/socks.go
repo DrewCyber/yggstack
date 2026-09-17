@@ -43,7 +43,7 @@ func (y *Yggstack) startSOCKS(listener net.Listener, nameserver string) {
 				conn.Close()
 				return
 			}
-			conn = client.conn(wrapCountingConn(conn, stats))
+			conn = client.conn(wrapGaugeOnlyConn(conn, stats))
 			dial := func(_ context.Context, network, addr string) (net.Conn, error) {
 				ctx, cancel := context.WithTimeout(client.ctx, 10*time.Second)
 				defer cancel()
@@ -88,22 +88,17 @@ func serveAssociate(client *workerScope, w io.Writer, req *socks5.Request, dial 
 		return err
 	}
 	client.goWorker(func() {
-		sessions := make(map[string]net.Conn)
-		var sessionsMu sync.Mutex
-		removeSession := func(key string, c net.Conn) {
-			sessionsMu.Lock()
-			if sessions[key] == c {
-				delete(sessions, key)
-			}
-			sessionsMu.Unlock()
-			c.Close()
+		sessions := new(sync.Map)
+		startUDPSessionReaper(client, sessions, udpSweepInterval)
+		removeSession := func(key string, sess *udpSession) {
+			sessions.CompareAndDelete(key, sess)
+			sess.conn.Close()
 		}
 		defer func() {
-			sessionsMu.Lock()
-			defer sessionsMu.Unlock()
-			for _, c := range sessions {
-				c.Close()
-			}
+			sessions.Range(func(key, value any) bool {
+				removeSession(key.(string), value.(*udpSession))
+				return true
+			})
 		}()
 		buf := make([]byte, 65535)
 		for {
@@ -122,20 +117,23 @@ func serveAssociate(client *workerScope, w io.Writer, req *socks5.Request, dial 
 				continue
 			}
 			key := from.String() + "->" + packet.DstAddr.String()
-			sessionsMu.Lock()
-			c := sessions[key]
-			sessionsMu.Unlock()
-			if c == nil {
-				c, err = dial(client.ctx, "udp", packet.DstAddr.String())
+			var sess *udpSession
+			if value, ok := sessions.Load(key); ok {
+				sess = value.(*udpSession)
+				if !sess.touch() {
+					sess = nil
+				}
+			}
+			if sess == nil {
+				c, err := dial(client.ctx, "udp", packet.DstAddr.String())
 				if err != nil {
 					continue
 				}
-				sessionsMu.Lock()
-				sessions[key] = c
-				sessionsMu.Unlock()
+				sess = newUDPSession(c)
+				sessions.Store(key, sess)
 				header := append([]byte(nil), packet.Header()...)
 				client.goWorker(func() {
-					defer removeSession(key, c)
+					defer removeSession(key, sess)
 					response := make([]byte, 65535)
 					for {
 						n, err := c.Read(response)
@@ -148,8 +146,8 @@ func serveAssociate(client *workerScope, w io.Writer, req *socks5.Request, dial 
 					}
 				})
 			}
-			if _, err := c.Write(packet.Data); err != nil {
-				removeSession(key, c)
+			if _, err := sess.conn.Write(packet.Data); err != nil {
+				removeSession(key, sess)
 			}
 		}
 	})
