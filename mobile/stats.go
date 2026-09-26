@@ -12,6 +12,9 @@ import (
 // socksStatsKey identifies the SOCKS5 proxy listener in the stats registry.
 const socksStatsKey = "socks"
 
+// httpStatsKey identifies the HTTP proxy listener in the stats registry.
+const httpStatsKey = "http"
+
 // listenerStatsWrappingEnabled toggles connection/byte instrumentation.
 var listenerStatsWrappingEnabled = true
 
@@ -85,7 +88,7 @@ func wrapCountingPacketConn(conn net.PacketConn, stats *listenerStats) net.Packe
 // the gauge is zeroed when the mapping handler exits.
 type listenerStats struct {
 	key         string
-	kind        string // "socks", "local-tcp", "local-udp", "remote-tcp", "remote-udp"
+	kind        string // "socks", "http", "local-tcp", "local-udp", "remote-tcp", "remote-udp"
 	listen      string
 	target      string
 	activeConns atomic.Uint64
@@ -123,16 +126,18 @@ func statsKindOrder(kind string) int {
 	switch kind {
 	case "socks":
 		return 0
-	case "local-tcp":
+	case "http":
 		return 1
-	case "local-udp":
+	case "local-tcp":
 		return 2
-	case "remote-tcp":
+	case "local-udp":
 		return 3
-	case "remote-udp":
+	case "remote-tcp":
 		return 4
-	default:
+	case "remote-udp":
 		return 5
+	default:
+		return 6
 	}
 }
 

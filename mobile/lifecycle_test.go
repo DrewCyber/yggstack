@@ -66,7 +66,7 @@ func TestStartupRollbackAndRestart(t *testing.T) {
 	}
 	defer occupied.Close()
 	done := make(chan error, 1)
-	go func() { done <- y.Start(occupied.Addr().String(), "") }()
+	go func() { done <- y.Start(occupied.Addr().String(), "", "") }()
 	select {
 	case err := <-done:
 		if err == nil {
@@ -79,7 +79,7 @@ func TestStartupRollbackAndRestart(t *testing.T) {
 		t.Fatal("partial startup retained")
 	}
 	for range 3 {
-		if err := y.Start("127.0.0.1:0", ""); err != nil {
+		if err := y.Start("127.0.0.1:0", "", ""); err != nil {
 			t.Fatal(err)
 		}
 		stopNode(t, y)
@@ -129,7 +129,7 @@ func socksClient(t *testing.T, y *Yggstack, command byte, target *net.TCPAddr) n
 
 func TestSOCKSConnectionsClosedOnStop(t *testing.T) {
 	y := offlineNode(t)
-	if err := y.Start("127.0.0.1:0", ""); err != nil {
+	if err := y.Start("127.0.0.1:0", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := y.netstack.ListenTCP(&net.TCPAddr{IP: y.core.Address()})
@@ -180,7 +180,7 @@ func TestSOCKSConnectionsClosedOnStop(t *testing.T) {
 
 func TestMappingRemoveReadd(t *testing.T) {
 	y := offlineNode(t)
-	if err := y.Start("", ""); err != nil {
+	if err := y.Start("", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, udp := range []bool{false, true} {

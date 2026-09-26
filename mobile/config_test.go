@@ -70,7 +70,7 @@ func TestInvalidConfigGettersAndStartup(t *testing.T) {
 		if err := y.AddRemoteUDPMapping(1234, "127.0.0.1:1234"); err == nil {
 			t.Fatal("UDP accepted invalid key")
 		}
-		if err := y.Start("", ""); err == nil {
+		if err := y.Start("", "", ""); err == nil {
 			t.Fatal("Start accepted invalid key")
 		}
 		if y.run != nil || y.core != nil || y.netstack != nil {
@@ -82,7 +82,7 @@ func TestInvalidConfigGettersAndStartup(t *testing.T) {
 	// Stats survive preflight failure: even resetListenerStats must not run.
 	stats := y.getOrCreateListenerStats("sentinel", "socks", "", "")
 	stats.txBytes.Add(7)
-	if err := y.Start("", ""); err == nil {
+	if err := y.Start("", "", ""); err == nil {
 		t.Fatal("Start accepted invalid regex")
 	}
 	if y.run != nil || y.core != nil || y.netstack != nil {

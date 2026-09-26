@@ -13,7 +13,7 @@ import (
 
 func TestSOCKSCountsOnlyYggdrasilPayload(t *testing.T) {
 	y := offlineNode(t)
-	if err := y.Start("127.0.0.1:0", ""); err != nil {
+	if err := y.Start("127.0.0.1:0", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := y.netstack.ListenTCP(&net.TCPAddr{IP: y.core.Address()})
@@ -79,7 +79,7 @@ func TestRemoteUDPCountsOnlyYggdrasilLeg(t *testing.T) {
 	if err := y.AddRemoteUDPMapping(23456, local.LocalAddr().String()); err != nil {
 		t.Fatal(err)
 	}
-	if err := y.Start("", ""); err != nil {
+	if err := y.Start("", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	key := remoteUDPMappingKey(23456, local.LocalAddr().String())

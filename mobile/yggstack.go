@@ -34,6 +34,7 @@ type Yggstack struct {
 	admin     *admin.AdminSocket
 	netstack  *netstack.YggdrasilNetstack
 	socks5Tcp net.Listener
+	httpTcp   net.Listener
 	logger    *log.Logger
 	logWriter io.Writer
 	logLevel  string
@@ -375,8 +376,9 @@ func (y *Yggstack) RetryPeersNow() error {
 	return nil
 }
 
-// Start starts the Yggstack node with optional SOCKS listener and nameserver
-func (y *Yggstack) Start(socksAddress string, nameserver string) (startErr error) {
+// Start starts the Yggstack node with optional SOCKS and HTTP proxy
+// listeners and a nameserver
+func (y *Yggstack) Start(socksAddress string, httpAddress string, nameserver string) (startErr error) {
 	y.mu.Lock()
 	defer y.mu.Unlock()
 
@@ -481,6 +483,12 @@ func (y *Yggstack) Start(socksAddress string, nameserver string) (startErr error
 		}
 		y.startSOCKS(y.socks5Tcp, nameserver)
 	}
+	if httpAddress != "" {
+		if y.httpTcp, err = net.Listen("tcp", httpAddress); err != nil {
+			return fmt.Errorf("failed to start HTTP proxy listener: %w", err)
+		}
+		y.startHTTP(y.httpTcp, nameserver)
+	}
 
 	// Setup local TCP mappings
 	for _, mapping := range y.localTCPMappings {
@@ -555,6 +563,7 @@ func (y *Yggstack) stopLocked() {
 	}
 	y.admin, y.multicast, y.core, y.netstack = nil, nil, nil, nil
 	y.socks5Tcp = nil
+	y.httpTcp = nil
 	y.run, y.mappings = nil, nil
 	y.resetListenerStats()
 	y.logger.Infof("Yggstack stopped")

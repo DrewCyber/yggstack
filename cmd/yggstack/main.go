@@ -39,6 +39,7 @@ type node struct {
 	admin      *admin.AdminSocket
 	socks5Tcp  net.Listener
 	socks5Unix net.Listener
+	httpTcp    net.Listener
 }
 
 type UDPSession struct {
@@ -66,7 +67,8 @@ func main() {
 	getpkey := flag.Bool("publickey", false, "use in combination with either -useconf or -useconffile, outputs your public key")
 	loglevel := flag.String("loglevel", "info", "loglevel to enable")
 	socks := flag.String("socks", "", "address to listen on for SOCKS, i.e. :1080; or UNIX socket file path, i.e. /tmp/yggstack.sock")
-	nameserver := flag.String("nameserver", "", "the Yggdrasil IPv6 address to use as a DNS server for SOCKS")
+	httpaddr := flag.String("http", "", "address to listen on for HTTP proxy, i.e. :8080")
+	nameserver := flag.String("nameserver", "", "the Yggdrasil IPv6 address to use as a DNS server for SOCKS/HTTP")
 	flag.Var(&localtcp, "local-tcp", "TCP ports to forward to the remote Yggdradil node, e.g. 22:[a:b:c:d]:22, 127.0.0.1:22:[a:b:c:d]:22")
 	flag.Var(&localudp, "local-udp", "UDP ports to forward to the remote Yggdrasil node, e.g. 22:[a:b:c:d]:2022, 127.0.0.1:[a:b:c:d]:22")
 	flag.Var(&remotetcp, "remote-tcp", "TCP ports to expose to the network, e.g. 22, 2022:22, 22:192.168.1.1:2022")
@@ -351,6 +353,39 @@ func main() {
 		}
 	}
 
+	// Create HTTP proxy server
+	{
+		if httpaddr != nil && *httpaddr != "" {
+			var resolver *types.NameResolver = nil
+			if nameserver != nil && *nameserver != "" {
+				resolver = types.NewNameResolver(s, *nameserver)
+			} else {
+				logger.Infof("DNS nameserver is not set!")
+				logger.Infof("HTTP proxy will not be able to resolve hostnames other than .pk.ygg !")
+				resolver = types.NewNameResolver(s, "")
+			}
+			proxy := &types.HTTPProxy{
+				Dial:     s.DialContext,
+				Resolver: resolver,
+				MTU:      uint64(n.core.MTU()),
+			}
+			logger.Infof("Starting HTTP proxy server on %s", *httpaddr)
+			n.httpTcp, err = net.Listen("tcp", *httpaddr)
+			if err != nil {
+				panic(err)
+			}
+			go func() {
+				for {
+					c, err := n.httpTcp.Accept()
+					if err != nil {
+						return
+					}
+					go proxy.ServeConn(context.Background(), c)
+				}
+			}()
+		}
+	}
+
 	// Create local TCP mappings (forwarding connections from local port
 	// to remote Yggdrasil node)
 	{
@@ -542,6 +577,10 @@ func main() {
 	if n.socks5Tcp != nil {
 		_ = n.socks5Tcp.Close()
 		logger.Infof("Stopped SOCKS5 TCP listener")
+	}
+	if n.httpTcp != nil {
+		_ = n.httpTcp.Close()
+		logger.Infof("Stopped HTTP proxy listener")
 	}
 	n.core.Stop()
 }

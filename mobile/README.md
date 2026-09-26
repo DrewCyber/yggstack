@@ -67,7 +67,7 @@ yggstack.stop()
 - `NewYggstack()` - Create new instance
 - `GenerateConfig()` - Generate configuration
 - `LoadConfigJSON(json)` - Load configuration
-- `Start(socksAddr, nameserver)` - Start node
+- `Start(socksAddr, httpAddr, nameserver)` - Start node
 - `Stop()` - Stop node
 - `IsRunning()` - Check status
 
