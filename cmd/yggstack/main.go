@@ -68,7 +68,7 @@ func main() {
 	loglevel := flag.String("loglevel", "info", "loglevel to enable")
 	socks := flag.String("socks", "", "address to listen on for SOCKS, i.e. :1080; or UNIX socket file path, i.e. /tmp/yggstack.sock")
 	httpaddr := flag.String("http", "", "address to listen on for HTTP proxy, i.e. :8080")
-	nameserver := flag.String("nameserver", "", "the Yggdrasil IPv6 address to use as a DNS server for SOCKS/HTTP")
+	nameserver := flag.String("nameserver", "", "the Yggdrasil IPv6 address to use as a DNS server for SOCKS/HTTP; comma-separated servers are tried in order with failover")
 	flag.Var(&localtcp, "local-tcp", "TCP ports to forward to the remote Yggdradil node, e.g. 22:[a:b:c:d]:22, 127.0.0.1:22:[a:b:c:d]:22")
 	flag.Var(&localudp, "local-udp", "UDP ports to forward to the remote Yggdrasil node, e.g. 22:[a:b:c:d]:2022, 127.0.0.1:[a:b:c:d]:22")
 	flag.Var(&remotetcp, "remote-tcp", "TCP ports to expose to the network, e.g. 22, 2022:22, 22:192.168.1.1:2022")

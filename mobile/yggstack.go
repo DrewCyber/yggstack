@@ -377,7 +377,9 @@ func (y *Yggstack) RetryPeersNow() error {
 }
 
 // Start starts the Yggstack node with optional SOCKS and HTTP proxy
-// listeners and a nameserver
+// listeners and a nameserver. The nameserver is a single "host[:port]"
+// server or a comma-separated list tried in order with failover (a single
+// server keeps the historical no-failover behavior).
 func (y *Yggstack) Start(socksAddress string, httpAddress string, nameserver string) (startErr error) {
 	y.mu.Lock()
 	defer y.mu.Unlock()

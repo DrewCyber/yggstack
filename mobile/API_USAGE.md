@@ -233,6 +233,15 @@ val nameserver = "[324:71e:281a:9ed3::53]:53"  // Example Yggdrasil DNS server
 yggstack?.start("127.0.0.1:1080", nameserver)
 ```
 
+Multiple servers can be given as a comma-separated list; they are tried in order and the
+resolver fails over to the next one when a server is unreachable or silent. A single server
+keeps the historical no-failover behavior:
+
+```kotlin
+val nameservers = "[324:71e:281a:9ed3::53]:53,[324:1234:5678:9abc::]:53"
+yggstack?.start("127.0.0.1:1080", nameservers)
+```
+
 ## Complete Example
 
 ```kotlin
