@@ -303,7 +303,9 @@ func (y *Yggstack) GetPeers() (string, error) {
 	return string(bs), nil
 }
 
-// GetPeersJSON returns detailed information about connected peers as JSON
+// GetPeersJSON returns detailed information about connected peers as JSON,
+// including each peer's Yggdrasil IPv6 address derived from its public key
+// (empty when the key is unknown, e.g. configured-but-never-connected peers).
 func (y *Yggstack) GetPeersJSON() (string, error) {
 	y.mu.RLock()
 	defer y.mu.RUnlock()
@@ -312,8 +314,44 @@ func (y *Yggstack) GetPeersJSON() (string, error) {
 		return "[]", fmt.Errorf("core not initialized")
 	}
 
+	type peerJSON struct {
+		URI      string `json:"URI"`
+		Up       bool   `json:"Up"`
+		Inbound  bool   `json:"Inbound"`
+		Address  string `json:"Address"`
+		Port     uint64 `json:"Port"`
+		Priority uint8  `json:"Priority"`
+		Cost     uint64 `json:"Cost"`
+		RXBytes  uint64 `json:"RXBytes"`
+		TXBytes  uint64 `json:"TXBytes"`
+		Uptime   int64  `json:"Uptime"`
+		Latency  int64  `json:"Latency"`
+	}
+
 	peersInfo := y.core.GetPeers()
-	bs, err := json.Marshal(peersInfo)
+	display := make([]peerJSON, 0, len(peersInfo))
+	for _, p := range peersInfo {
+		addr := ""
+		if len(p.Key) > 0 {
+			if a := address.AddrForKey(p.Key); a != nil {
+				addr = net.IP(a[:]).String()
+			}
+		}
+		display = append(display, peerJSON{
+			URI:      p.URI,
+			Up:       p.Up,
+			Inbound:  p.Inbound,
+			Address:  addr,
+			Port:     p.Port,
+			Priority: p.Priority,
+			Cost:     p.Cost,
+			RXBytes:  p.RXBytes,
+			TXBytes:  p.TXBytes,
+			Uptime:   int64(p.Uptime),
+			Latency:  int64(p.Latency),
+		})
+	}
+	bs, err := json.Marshal(display)
 	if err != nil {
 		return "[]", fmt.Errorf("failed to marshal peers info: %w", err)
 	}
