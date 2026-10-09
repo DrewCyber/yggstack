@@ -41,6 +41,7 @@ type Yggstack struct {
 	config    *config.NodeConfig
 	run       *workerScope
 	mappings  map[string]*workerScope
+	ping      *pingSession
 
 	// Port mappings
 	localTCPMappings  []types.TCPMapping
@@ -538,6 +539,9 @@ func (y *Yggstack) Stop() error {
 // Workers must not acquire y.mu: teardown holds it until every worker is joined.
 func (y *Yggstack) stopLocked() {
 	y.isRunning = false
+	// End the ping session first so its endpoint is not used against the
+	// netstack being torn down below.
+	y.stopPingLocked()
 	if y.run != nil {
 		y.run.Close()
 	}
