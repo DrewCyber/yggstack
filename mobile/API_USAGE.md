@@ -16,8 +16,8 @@ This document describes how to use Yggstack mobile bindings in your Android appl
 pinned versions. If installing manually, never use `@latest` and never run `gomobile init`;
 use the exact versions pinned in `build-android.sh`:
 ```bash
-go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
-go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
+go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260908204917-8b95e45f8d3e
+go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260908204917-8b95e45f8d3e
 ```
 
 2. Set Android SDK path:
@@ -398,8 +398,8 @@ class YggstackService : Service() {
 
 **Problem**: gomobile not found
 ```bash
-go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
-go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
+go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260908204917-8b95e45f8d3e
+go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260908204917-8b95e45f8d3e
 ```
 (Use the pinned versions from `build-android.sh`, never `@latest`.)
 

@@ -30,8 +30,8 @@ echo -e "${GREEN}========================================${NC}"
 if ! command -v gomobile &> /dev/null; then
     echo -e "${RED}Error: gomobile is not installed${NC}"
     echo "Installing gomobile..."
-    go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260821190718-4776eadac327
-    go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260821190718-4776eadac327
+    go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260908204917-8b95e45f8d3e
+    go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260908204917-8b95e45f8d3e
 fi
 
 # Prepare the gomobile toolchain directory.
