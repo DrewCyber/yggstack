@@ -29,8 +29,9 @@ type YggdrasilNIC struct {
 	// writeBuf is reused across packets; WritePackets is invoked
 	// concurrently from several transport goroutines, so access is
 	// serialized. (A shared unguarded buffer here caused heap corruption.)
-	writeMu  sync.Mutex
-	writeBuf []byte
+	writeMu     sync.Mutex
+	writeBuf    []byte
+	packetQueue chan []byte
 }
 
 func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
@@ -40,18 +41,22 @@ func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 		return make([]byte, mtu)
 	}}
 	nic := &YggdrasilNIC{
-		ipv6rwc:    rwc,
-		interrupt:  ygg.Close,
-		writeBuf:   make([]byte, mtu),
-		rstPackets: make(chan *stack.PacketBuffer, 100),
+		ipv6rwc:     rwc,
+		interrupt:   ygg.Close,
+		writeBuf:    make([]byte, mtu),
+		rstPackets:  make(chan *stack.PacketBuffer, 100),
+		packetQueue: make(chan []byte, 1000),
 	}
 	s.nic = nic
 	if err := s.stack.CreateNIC(1, nic); err != nil {
 		return err
 	}
-	nic.workers.Add(2)
+	nic.workers.Add(3)
 	go func() {
 		defer nic.workers.Done()
+		// Sole sender of packetQueue: closing it here terminates the
+		// delivery worker's range after the reader exits.
+		defer close(nic.packetQueue)
 		for {
 			// Scratch buffer is pooled; the delivered payload is a private
 			// copy because gvisor endpoints may retain views beyond this
@@ -62,11 +67,26 @@ func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 				rxPool.Put(buf)
 				break
 			}
-			payload := make([]byte, rx)
-			copy(payload, buf[:rx])
+			packet := make([]byte, rx)
+			copy(packet, buf[:rx])
 			rxPool.Put(buf)
+
+			// Hand off to the delivery worker instead of dispatching here:
+			// gvisor's ingress path can stall the reader long enough to
+			// back up the transport, so reads keep draining while the
+			// queue absorbs bursts (upstream 5dce7f0).
+			select {
+			case nic.packetQueue <- packet:
+			default:
+				log.Println("Packet queue full, dropping packet")
+			}
+		}
+	}()
+	go func() {
+		defer nic.workers.Done()
+		for packet := range nic.packetQueue {
 			pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.MakeWithData(payload),
+				Payload: buffer.MakeWithData(packet),
 			})
 			nic.stateMu.RLock()
 			dispatcher := nic.dispatcher
