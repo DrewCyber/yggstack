@@ -43,6 +43,10 @@ type Yggstack struct {
 	mappings  map[string]*workerScope
 	ping      *pingSession
 
+	// peerCallback is guarded by mu and consumed by startPeerForwarder
+	// at Start; the forwarder worker itself never reads it afterwards.
+	peerCallback PeerCallback
+
 	// Port mappings
 	localTCPMappings  []types.TCPMapping
 	localUDPMappings  []types.UDPMapping
@@ -314,6 +318,13 @@ func (y *Yggstack) GetPeersJSON() (string, error) {
 		return "[]", fmt.Errorf("core not initialized")
 	}
 
+	return buildPeersJSON(y.core), nil
+}
+
+// buildPeersJSON renders the core's peer list in the shared schema. It is
+// a pure function of the core so the peer forwarder worker can call it —
+// run workers must not take Yggstack.mu.
+func buildPeersJSON(core *core.Core) string {
 	type peerJSON struct {
 		URI      string `json:"URI"`
 		Up       bool   `json:"Up"`
@@ -328,7 +339,7 @@ func (y *Yggstack) GetPeersJSON() (string, error) {
 		Latency  int64  `json:"Latency"`
 	}
 
-	peersInfo := y.core.GetPeers()
+	peersInfo := core.GetPeers()
 	display := make([]peerJSON, 0, len(peersInfo))
 	for _, p := range peersInfo {
 		addr := ""
@@ -353,9 +364,9 @@ func (y *Yggstack) GetPeersJSON() (string, error) {
 	}
 	bs, err := json.Marshal(display)
 	if err != nil {
-		return "[]", fmt.Errorf("failed to marshal peers info: %w", err)
+		return "[]"
 	}
-	return string(bs), nil
+	return string(bs)
 }
 
 // AddLivePeer adds a peer to the running yggdrasil core without restarting.
@@ -490,6 +501,11 @@ func (y *Yggstack) Start(socksAddress string, httpAddress string, nameserver str
 	if y.core, err = core.New(y.config.Certificate, y.buildLogger(), options...); err != nil {
 		return fmt.Errorf("failed to create core: %w", err)
 	}
+
+	// Register before any configured peering can come up, so the very
+	// first transition is not missed (the baseline snapshot would still
+	// heal it, but this keeps the event stream complete).
+	y.startPeerForwarder()
 
 	address, subnet := y.core.Address(), y.core.Subnet()
 	publicstr := hex.EncodeToString(publicKey)
