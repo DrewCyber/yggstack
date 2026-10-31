@@ -35,4 +35,4 @@ require (
 
 tool golang.org/x/mobile/cmd/gomobile
 
-replace github.com/yggdrasil-network/yggdrasil-go => github.com/DrewCyber/yggdrasil-go v0.0.0-20261031182820-03adf4dd17ff
+replace github.com/yggdrasil-network/yggdrasil-go => github.com/DrewCyber/yggdrasil-go v0.0.0-20261031184025-d832d02619a6
