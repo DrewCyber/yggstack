@@ -87,7 +87,8 @@ func TestSelfPingThroughTheStack(t *testing.T) {
 		t.Fatalf("done reason = %q, want completed", got)
 	}
 	// The very first probe to any destination can be lost to the overlay's
-	// key lookup (by design: it is reported as a plain timeout). Every
+	// first-contact path lookup and session handshake (by design: it is
+	// reported as a plain timeout). Every
 	// probe after the first must be answered in-stack.
 	if got := c.count(`"Success":true`); got < 2 {
 		t.Fatalf("successful probes = %d, want >= 2; events: %v", got, c.snapshot())

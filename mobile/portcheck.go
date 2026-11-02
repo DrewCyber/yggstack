@@ -21,11 +21,12 @@ import (
 //	"error"     — node not running, or addrPort is not a Yggdrasil address
 //
 // The dial is attempted twice: the first attempt uses a short window —
-// on a cold start (or first contact) the overlay's key lookup is still
-// in flight and its only role is to trigger that lookup; a warm
+// on a cold start (or first contact) the overlay's path lookup (the
+// signed tree-path discovery) and session handshake are still in
+// flight, and the dial's only role is to trigger them; a warm
 // destination answers well within it. The retry then dials with the
-// full window through the now-cached key. A genuine refusal answers
-// fast on both attempts. Blocks for up to ~timeoutMs + 400ms + 1s;
+// full window through the now-cached path and session. A genuine
+// refusal answers fast on both attempts. Blocks for up to ~timeoutMs + 400ms + 1s;
 // safe to call concurrently with Stop (a dial interrupted by teardown
 // reports "timeout").
 func (y *Yggstack) CheckTCPPort(addrPort string, timeoutMs int64) string {
@@ -84,9 +85,11 @@ func (y *Yggstack) CheckTCPPort(addrPort string, timeoutMs int64) string {
 // The probe datagram is chosen by port (see udpProbePayload): port 53 gets
 // a real DNS query, where a zero-filled datagram is silently dropped by
 // most servers. Datagrams are re-sent across the window (see probeSendAt):
-// on a cold start the first ones are consumed by the overlay's key lookup
-// (TCP rides this out with SYN retransmission; UDP has none), so only a
-// later send gets through.
+// on a cold start the earliest ones are held back until the overlay's
+// first-contact path lookup and session handshake complete — each layer
+// parks one packet until the route exists (TCP rides this out with SYN
+// retransmission; UDP has none), so only a later send gets through in
+// time.
 func (y *Yggstack) CheckUDPPort(addrPort string, timeoutMs int64) string {
 	addr, err := resolveYggUDPAddr(addrPort)
 	if err != nil {
@@ -131,8 +134,9 @@ func (y *Yggstack) CheckUDPPort(addrPort string, timeoutMs int64) string {
 }
 
 // probeSendAt spaces probe datagram sends across the check window: the
-// overlay's cold-start key lookup swallows the earliest ones, so the
-// cadence keeps re-sending until past the typical lookup latency.
+// overlay's cold-start path lookup and session handshake hold back the
+// earliest ones, so the cadence keeps re-sending until past their
+// typical latency.
 var probeSendAt = []time.Duration{
 	0,
 	400 * time.Millisecond,

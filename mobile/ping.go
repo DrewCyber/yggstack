@@ -35,8 +35,8 @@ type pingSession struct {
 // each waiting up to timeoutMs for its reply. Every probe result and the
 // session end are reported through cb. Replaces any running session;
 // requires a running node. The first probe to an unknown destination may
-// be delayed by the overlay's key lookup and time out — it is reported
-// as-is.
+// be delayed by the overlay's first-contact path lookup and session
+// handshake and time out — it is reported as-is.
 func (y *Yggstack) StartPing(address string, count int, timeoutMs int64, intervalMs int64, cb PingCallback) error {
 	ip := net.ParseIP(strings.TrimSpace(strings.Trim(address, "[]")))
 	if ip == nil || ip.To16() == nil {
