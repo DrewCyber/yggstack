@@ -110,6 +110,62 @@ func remoteUDPMappingKey(remotePort int, localAddr string) string {
 	return fmt.Sprintf("rudp:%d->%s", remotePort, localAddr)
 }
 
+func (y *Yggstack) hasRemoteTCPMappingLocked(remotePort int, localAddr string) bool {
+	for _, m := range y.remoteTCPMappings {
+		if m.Listen.Port == remotePort && m.Mapped.String() == localAddr {
+			return true
+		}
+	}
+	return false
+}
+
+func (y *Yggstack) remoteTCPMappingOnPortLocked(remotePort int) *types.TCPMapping {
+	for i := range y.remoteTCPMappings {
+		if y.remoteTCPMappings[i].Listen.Port == remotePort {
+			return &y.remoteTCPMappings[i]
+		}
+	}
+	return nil
+}
+
+func (y *Yggstack) hasRemoteUDPMappingLocked(remotePort int, localAddr string) bool {
+	for _, m := range y.remoteUDPMappings {
+		if m.Listen.Port == remotePort && m.Mapped.String() == localAddr {
+			return true
+		}
+	}
+	return false
+}
+
+func (y *Yggstack) remoteUDPMappingOnPortLocked(remotePort int) *types.UDPMapping {
+	for i := range y.remoteUDPMappings {
+		if y.remoteUDPMappings[i].Listen.Port == remotePort {
+			return &y.remoteUDPMappings[i]
+		}
+	}
+	return nil
+}
+
+func (y *Yggstack) startRemoteTCPMappingLocked(key string, mapping types.TCPMapping, listener net.Listener) {
+	y.stopMapping(key)
+	s := newWorkerScope(y.run.ctx)
+	y.mappings[key] = s
+	s.goWorker(func() {
+		defer s.Close()
+		y.serveRemoteTCPListener(s, key, mapping, listener)
+	})
+}
+
+func (y *Yggstack) startRemoteUDPMappingLocked(key string, mapping types.UDPMapping, listener net.PacketConn) {
+	y.stopMapping(key)
+	s := newWorkerScope(y.run.ctx)
+	y.mappings[key] = s
+	s.goWorker(func() {
+		defer s.Close()
+		y.serveRemoteUDPListener(s, key, mapping, listener)
+	})
+}
+
 // SetLogCallback sets custom log callback for Android
 func (y *Yggstack) SetLogCallback(callback LogCallback) {
 	if callback != nil {
@@ -711,6 +767,9 @@ func (y *Yggstack) AddRemoteTCPMapping(remotePort int, localAddr string) error {
 	if y.config == nil {
 		return fmt.Errorf("config not loaded")
 	}
+	if remotePort < 1 || remotePort > 65535 {
+		return fmt.Errorf("invalid remote TCP port %d", remotePort)
+	}
 
 	localTCPAddr, err := net.ResolveTCPAddr("tcp", localAddr)
 	if err != nil {
@@ -730,17 +789,39 @@ func (y *Yggstack) AddRemoteTCPMapping(remotePort int, localAddr string) error {
 		Port: remotePort,
 	}
 
+	localKey := localTCPAddr.String()
+	if y.hasRemoteTCPMappingLocked(remotePort, localKey) {
+		y.logger.Infof("Remote TCP mapping already exists: [%s]:%d -> %s", ip, remotePort, localAddr)
+		return nil
+	}
+	if existing := y.remoteTCPMappingOnPortLocked(remotePort); existing != nil {
+		return fmt.Errorf(
+			"remote TCP port %d already mapped to %s",
+			remotePort,
+			existing.Mapped.String(),
+		)
+	}
+
 	mapping := types.TCPMapping{
 		Listen: remoteTCPAddr,
 		Mapped: localTCPAddr,
 	}
 
+	// Bind synchronously when the node is already up. Otherwise the caller
+	// cannot distinguish "mapping added" from "listener failed to bind".
+	var listener net.Listener
+	if y.isRunning {
+		listener, err = y.netstack.ListenTCP(remoteTCPAddr)
+		if err != nil {
+			return fmt.Errorf("listen remote TCP port %d: %w", remotePort, err)
+		}
+	}
+
 	y.remoteTCPMappings = append(y.remoteTCPMappings, mapping)
 
-	// If already running, start the mapping handler
 	if y.isRunning {
 		key := remoteTCPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
-		y.startMapping(key, func(scope *workerScope) { y.handleRemoteTCPMappingCtx(scope, key, mapping) })
+		y.startRemoteTCPMappingLocked(key, mapping, listener)
 	}
 
 	y.logger.Infof("Added remote TCP mapping: [%s]:%d -> %s", ip, remotePort, localAddr)
@@ -755,6 +836,9 @@ func (y *Yggstack) AddRemoteUDPMapping(remotePort int, localAddr string) error {
 
 	if y.config == nil {
 		return fmt.Errorf("config not loaded")
+	}
+	if remotePort < 1 || remotePort > 65535 {
+		return fmt.Errorf("invalid remote UDP port %d", remotePort)
 	}
 
 	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
@@ -775,17 +859,37 @@ func (y *Yggstack) AddRemoteUDPMapping(remotePort int, localAddr string) error {
 		Port: remotePort,
 	}
 
+	localKey := localUDPAddr.String()
+	if y.hasRemoteUDPMappingLocked(remotePort, localKey) {
+		y.logger.Infof("Remote UDP mapping already exists: [%s]:%d -> %s", ip, remotePort, localAddr)
+		return nil
+	}
+	if existing := y.remoteUDPMappingOnPortLocked(remotePort); existing != nil {
+		return fmt.Errorf(
+			"remote UDP port %d already mapped to %s",
+			remotePort,
+			existing.Mapped.String(),
+		)
+	}
+
 	mapping := types.UDPMapping{
 		Listen: remoteUDPAddr,
 		Mapped: localUDPAddr,
 	}
 
+	var listener net.PacketConn
+	if y.isRunning {
+		listener, err = y.netstack.ListenUDP(remoteUDPAddr)
+		if err != nil {
+			return fmt.Errorf("listen remote UDP port %d: %w", remotePort, err)
+		}
+	}
+
 	y.remoteUDPMappings = append(y.remoteUDPMappings, mapping)
 
-	// If already running, start the mapping handler
 	if y.isRunning {
 		key := remoteUDPMappingKey(mapping.Listen.Port, mapping.Mapped.String())
-		y.startMapping(key, func(scope *workerScope) { y.handleRemoteUDPMappingCtx(scope, key, mapping) })
+		y.startRemoteUDPMappingLocked(key, mapping, listener)
 	}
 
 	y.logger.Infof("Added remote UDP mapping: [%s]:%d -> %s", ip, remotePort, localAddr)
@@ -1114,6 +1218,11 @@ func (y *Yggstack) handleRemoteTCPMappingCtx(scope *workerScope, key string, map
 		y.logger.Errorf("Failed to listen on remote TCP %s: %s", mapping.Listen, err)
 		return
 	}
+	y.serveRemoteTCPListener(scope, key, mapping, listener)
+}
+
+func (y *Yggstack) serveRemoteTCPListener(scope *workerScope, key string, mapping types.TCPMapping, listener net.Listener) {
+	ctx := scope.ctx
 	defer listener.Close()
 
 	if !scope.own(listener) {
@@ -1171,15 +1280,20 @@ func (y *Yggstack) handleRemoteUDPMappingCtx(scope *workerScope, key string, map
 	default:
 	}
 
-	mtu := y.core.MTU()
-	stats := y.getOrCreateListenerStats(key, "remote-udp", mapping.Listen.String(), mapping.Mapped.String())
-	defer stats.sessionsEnded()
-
 	rawListenConn, err := y.netstack.ListenUDP(mapping.Listen)
 	if err != nil {
 		y.logger.Errorf("Failed to listen on remote UDP %s: %s", mapping.Listen, err)
 		return
 	}
+	y.serveRemoteUDPListener(scope, key, mapping, rawListenConn)
+}
+
+func (y *Yggstack) serveRemoteUDPListener(scope *workerScope, key string, mapping types.UDPMapping, rawListenConn net.PacketConn) {
+	ctx := scope.ctx
+	mtu := y.core.MTU()
+	stats := y.getOrCreateListenerStats(key, "remote-udp", mapping.Listen.String(), mapping.Mapped.String())
+	defer stats.sessionsEnded()
+
 	// The socket is shared by all client sessions; the wrapper attributes
 	// every ReadFrom/WriteTo to this mapping's byte counters
 	udpListenConn := wrapCountingPacketConn(rawListenConn, stats)
